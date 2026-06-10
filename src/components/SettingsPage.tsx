@@ -126,7 +126,7 @@ const UI_LANGUAGE_OPTIONS: import("./ui/LanguageSelector").LanguageOption[] = [
   { value: "es", label: "Español", flag: "🇪🇸" },
   { value: "fr", label: "Français", flag: "🇫🇷" },
   { value: "de", label: "Deutsch", flag: "🇩🇪" },
-  { value: "pt", label: "Português", flag: "🇵🇹" },
+  { value: "pt", label: "Português (Brasil)", flag: "🇧🇷" },
   { value: "it", label: "Italiano", flag: "🇮🇹" },
   { value: "ru", label: "Русский", flag: "🇷🇺" },
   { value: "ja", label: "日本語", flag: "🇯🇵" },
