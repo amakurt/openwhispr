@@ -384,8 +384,8 @@
     },
     {
       "code": "pt",
-      "label": "Portuguese",
-      "flag": "\uD83C\uDDF5\uD83C\uDDF9",
+      "label": "Português (Brasil)",
+      "flag": "\uD83C\uDDE7\uD83C\uDDF7",
       "whisper": true,
       "parakeet": true,
       "assemblyai": true,
