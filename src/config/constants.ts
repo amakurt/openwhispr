@@ -43,6 +43,19 @@ export const ensureV1Suffix = (base: string): string => {
   return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
 };
 
+// Ordered bases to try when listing models from an OpenAI-compatible server.
+// Self-hosted servers (LM Studio, Ollama, vLLM) serve the API under /v1 even
+// when users enter the bare origin, and LM Studio's native REST base
+// (/api/v1 or /api/v0) has its OpenAI-compatible sibling at /v1.
+export const getModelListBaseCandidates = (base: string): string[] => {
+  const normalized = normalizeBaseUrl(base);
+  if (!normalized) return [];
+  const nativeApiMatch = normalized.match(/^(.+?)\/api\/v[01]$/i);
+  if (nativeApiMatch) return [normalized, `${nativeApiMatch[1]}/v1`];
+  const withV1 = ensureV1Suffix(normalized);
+  return withV1 === normalized ? [normalized] : [normalized, withV1];
+};
+
 const env = (typeof import.meta !== "undefined" && (import.meta as any).env) || {};
 
 const computeBaseUrl = (candidates: Array<string | undefined>, fallback: string): string => {
@@ -75,8 +88,10 @@ export const API_ENDPOINTS = {
   ANTHROPIC: "https://api.anthropic.com/v1/messages",
   GEMINI: "https://generativelanguage.googleapis.com/v1beta",
   GROQ_BASE: "https://api.groq.com/openai/v1",
+  CORTI_MODELS_BASE: "https://ai.eu.corti.app/v1",
   XAI_BASE: "https://api.x.ai/v1",
   MISTRAL_BASE: "https://api.mistral.ai/v1",
+  OPENROUTER_BASE: "https://openrouter.ai/api/v1",
   TRANSCRIPTION_BASE: DEFAULT_TRANSCRIPTION_BASE,
   TRANSCRIPTION: buildApiUrl(DEFAULT_TRANSCRIPTION_BASE, "/audio/transcriptions"),
 } as const;
@@ -92,6 +107,9 @@ export const MODEL_CONSTRAINTS = {
   MODEL_TEST_TIMEOUT: 5000, // 5 seconds for model validation
   INFERENCE_TIMEOUT: 30000, // 30 seconds default (configurable)
 } as const;
+
+// List length above which pickers switch to a searchable variant.
+export const LIST_SEARCH_THRESHOLD = 12;
 
 // Token Limits
 export const TOKEN_LIMITS = {

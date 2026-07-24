@@ -2,10 +2,13 @@ import type { InferenceProvider } from "./types";
 import { API_ENDPOINTS, TOKEN_LIMITS, buildApiUrl } from "../../../config/constants";
 import { getOpenAiApiConfig } from "../../../models/ModelRegistry";
 import { getSettings } from "../../../stores/settingsStore";
-import { withRetry, createApiRetryStrategy } from "../../../utils/retry";
+import { withRetry, createApiRetryStrategy, httpError } from "../../../utils/retry";
 import logger from "../../../utils/logger";
 import { getConfiguredOpenAIBase } from "../openaiBase";
 import { applyThinkingSuppression } from "../thinkingSuppression";
+import { detectEndpointDialect } from "../thinkingSuppressionDialects";
+import { extractApiErrorMessage } from "../apiErrorMessage";
+import { wrapCleanupTranscript } from "../../../config/prompts";
 
 const OPENAI_ENDPOINT_PREF_STORAGE_KEY = "openAiEndpointPreference";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -123,6 +126,7 @@ export const openaiProvider: InferenceProvider = {
   async call({ text, model, agentName, config, ctx }) {
     const resolvedProvider = config.provider || getSettings().cleanupProvider || "";
     const isCustomProvider = resolvedProvider === "custom";
+    const isOpenRouter = resolvedProvider === "openrouter";
 
     logger.logReasoning("OPENAI_START", {
       model,
@@ -131,7 +135,9 @@ export const openaiProvider: InferenceProvider = {
     });
 
     const overrideKey = isCustomProvider ? config.customApiKey?.trim() : "";
-    const apiKey = overrideKey || (await ctx.getApiKey(isCustomProvider ? "custom" : "openai"));
+    const apiKey =
+      overrideKey ||
+      (await ctx.getApiKey(isCustomProvider ? "custom" : isOpenRouter ? "openrouter" : "openai"));
 
     logger.logReasoning("OPENAI_API_KEY", {
       hasApiKey: !!apiKey,
@@ -139,14 +145,24 @@ export const openaiProvider: InferenceProvider = {
     });
 
     const systemPrompt = config.systemPrompt || ctx.getSystemPrompt(agentName);
+    const userContent = config.systemPrompt ? text : wrapCleanupTranscript(text);
     const messages = [
       { role: "system", content: systemPrompt },
-      { role: "user", content: text },
+      { role: "user", content: userContent },
     ];
 
-    const openAiBase = config.baseUrl?.trim() || getConfiguredOpenAIBase();
-    await detectServerType(openAiBase);
-    const endpointCandidates = getEndpointCandidates(openAiBase);
+    const openAiBase = isOpenRouter
+      ? API_ENDPOINTS.OPENROUTER_BASE
+      : config.baseUrl?.trim() || getConfiguredOpenAIBase();
+    const dialect = detectEndpointDialect(openAiBase);
+    // OpenRouter and known dialect hosts speak Chat Completions only — no /responses probe needed.
+    let endpointCandidates: Array<{ url: string; type: "responses" | "chat" }>;
+    if (isOpenRouter || dialect) {
+      endpointCandidates = [{ url: buildApiUrl(openAiBase, "/chat/completions"), type: "chat" }];
+    } else {
+      await detectServerType(openAiBase);
+      endpointCandidates = getEndpointCandidates(openAiBase);
+    }
     const isCustomEndpoint = openAiBase !== API_ENDPOINTS.OPENAI_BASE;
 
     logger.logReasoning("OPENAI_ENDPOINTS", {
@@ -185,7 +201,8 @@ export const openaiProvider: InferenceProvider = {
               )
             );
 
-          const apiConfig = getOpenAiApiConfig(model);
+          // A known endpoint host knows its own request shape better than the model id does.
+          const apiConfig = dialect ?? getOpenAiApiConfig(model, resolvedProvider);
           const requestBody: Record<string, unknown> = { model };
 
           if (type === "responses") {
@@ -195,11 +212,14 @@ export const openaiProvider: InferenceProvider = {
           } else {
             requestBody.messages = messages;
             requestBody[apiConfig.tokenParam] = maxTokens;
-            applyThinkingSuppression(requestBody, model, resolvedProvider, config);
+            if (!config.systemPrompt && model.includes("gpt-oss")) {
+              requestBody.reasoning_effort = "low";
+            }
+            applyThinkingSuppression(requestBody, model, resolvedProvider, config, openAiBase);
           }
 
           if (apiConfig.supportsTemperature) {
-            requestBody.temperature = config.temperature || 0.3;
+            requestBody.temperature = config.temperature ?? (config.systemPrompt ? 0.3 : 0);
           }
 
           const res = await fetch(endpoint, {
@@ -214,14 +234,16 @@ export const openaiProvider: InferenceProvider = {
 
           if (!res.ok) {
             const errorData = await res.json().catch(() => ({ error: res.statusText }));
-            const errorMessage =
-              errorData.error?.message || errorData.message || `OpenAI API error: ${res.status}`;
+            const errorMessage = extractApiErrorMessage(
+              errorData,
+              `OpenAI API error: ${res.status}`
+            );
 
             const isUnsupportedEndpoint =
               (res.status === 404 || res.status === 405) && type === "responses";
 
             if (isUnsupportedEndpoint) {
-              lastError = new Error(errorMessage);
+              lastError = httpError(errorMessage, res.status);
               rememberPreference(openAiBase, "chat");
               logger.logReasoning("OPENAI_ENDPOINT_FALLBACK", {
                 attemptedEndpoint: endpoint,
@@ -230,7 +252,7 @@ export const openaiProvider: InferenceProvider = {
               continue;
             }
 
-            throw new Error(errorMessage);
+            throw httpError(errorMessage, res.status);
           }
 
           rememberPreference(openAiBase, type);

@@ -5,6 +5,7 @@ const { isGlobeLikeHotkey } = HotkeyManager;
 const DragManager = require("./dragManager");
 const MenuManager = require("./menuManager");
 const DevServerManager = require("./devServerManager");
+const dockManager = require("./dockManager");
 const { i18nMain } = require("./i18nMain");
 const { DEV_SERVER_PORT } = DevServerManager;
 const {
@@ -47,6 +48,7 @@ class WindowManager {
     this._panelStartPosition = "bottom-right";
     this._isDictatingToggle = false;
     this._pendingMeetingNoteNavigation = null;
+    this._pendingNoteNavigation = null;
 
     app.on("before-quit", () => {
       this.isQuitting = true;
@@ -218,13 +220,15 @@ class WindowManager {
     let lastToggleTime = 0;
     const DEBOUNCE_MS = 150;
 
-    return async () => {
+    // globalShortcut registrations pass the hotkey that fired; native-shortcut
+    // backends invoke the callback bare (their slot holds only the primary).
+    return async (triggeredHotkey) => {
       if (this.hotkeyManager.isInListeningMode()) {
         return;
       }
 
       const activationMode = this.getActivationMode();
-      const currentHotkey = this.hotkeyManager.getCurrentHotkey?.();
+      const currentHotkey = triggeredHotkey || this.hotkeyManager.getCurrentHotkey?.();
 
       if (
         process.platform === "darwin" &&
@@ -389,7 +393,7 @@ class WindowManager {
     return required;
   }
 
-  startWindowsPushToTalk() {
+  startWindowsPushToTalk(key) {
     if (this.winPushState?.active) {
       return;
     }
@@ -401,6 +405,7 @@ class WindowManager {
 
     this.winPushState = {
       active: true,
+      key,
       downTime,
       isRecording: false,
     };
@@ -417,8 +422,13 @@ class WindowManager {
     }, MIN_HOLD_DURATION_MS);
   }
 
-  handleWindowsPushKeyUp() {
+  // With several dictation hotkeys bound, only the key that started the push
+  // may stop it; called without a key to force-stop (resetWindowsPushState).
+  handleWindowsPushKeyUp(key) {
     if (!this.winPushState?.active) {
+      return;
+    }
+    if (key && this.winPushState.key && key !== this.winPushState.key) {
       return;
     }
 
@@ -464,6 +474,13 @@ class WindowManager {
     this._sendDictationToggle("toggle-voice-agent");
   }
 
+  sendToggleTranslation() {
+    // Same PID-capture need as the voice agent: translation hotkeys don't
+    // capture the target at their call sites.
+    if (this.textEditMonitor) this.textEditMonitor.captureTargetPid();
+    this._sendDictationToggle("toggle-translation");
+  }
+
   sendStartDictation() {
     if (this.hotkeyManager.isInListeningMode()) {
       return;
@@ -481,6 +498,17 @@ class WindowManager {
     }
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send("stop-dictation");
+      this._isDictatingToggle = false;
+      this.meetingDetectionEngine?.setUserRecording(false);
+    }
+  }
+
+  sendCancelDictation() {
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("cancel-hotkey-pressed");
       this._isDictatingToggle = false;
       this.meetingDetectionEngine?.setUserRecording(false);
     }
@@ -596,6 +624,7 @@ class WindowManager {
         this.controlPanelWindow.show();
       }
       this.controlPanelWindow.focus();
+      dockManager.setControlPanelVisible(true);
       return;
     }
 
@@ -636,6 +665,7 @@ class WindowManager {
       if (!this.controlPanelWindow.isVisible()) {
         this.controlPanelWindow.show();
         this.controlPanelWindow.focus();
+        dockManager.setControlPanelVisible(true);
       }
     }, 10000);
 
@@ -645,11 +675,9 @@ class WindowManager {
 
     this.controlPanelWindow.once("ready-to-show", () => {
       clearVisibilityTimer();
-      if (process.platform === "darwin" && app.dock) {
-        app.dock.show();
-      }
       this.controlPanelWindow.show();
       this.controlPanelWindow.focus();
+      dockManager.setControlPanelVisible(true);
     });
 
     this.controlPanelWindow.on("close", (event) => {
@@ -662,6 +690,7 @@ class WindowManager {
     this.controlPanelWindow.on("closed", () => {
       clearVisibilityTimer();
       this.controlPanelWindow = null;
+      dockManager.setControlPanelVisible(false);
     });
 
     MenuManager.setupControlPanelMenu(this.controlPanelWindow, () => this.openSettings());
@@ -684,6 +713,7 @@ class WindowManager {
         if (!this.controlPanelWindow.isVisible()) {
           this.controlPanelWindow.show();
           this.controlPanelWindow.focus();
+          dockManager.setControlPanelVisible(true);
         }
       }
     );
@@ -1069,10 +1099,7 @@ class WindowManager {
     }
 
     this.controlPanelWindow.hide();
-
-    if (process.platform === "darwin" && app.dock) {
-      app.dock.hide();
-    }
+    dockManager.setControlPanelVisible(false);
   }
 
   hideDictationPanel() {
@@ -1159,6 +1186,9 @@ class WindowManager {
       ...NOTIFICATION_WINDOW_CONFIG,
       ...position,
     });
+
+    // Keep the prompt visible to the user but out of screen shares and recordings.
+    this.notificationWindow.setContentProtection(true);
 
     if (process.platform === "darwin") {
       this.notificationWindow.setIgnoreMouseEvents(true, { forward: true });
@@ -1345,6 +1375,18 @@ class WindowManager {
   consumePendingMeetingNoteNavigation() {
     const payload = this._pendingMeetingNoteNavigation;
     this._pendingMeetingNoteNavigation = null;
+    return payload;
+  }
+
+  async queueNoteNavigation(payload) {
+    this._pendingNoteNavigation = payload;
+    await this.createControlPanelWindow();
+    this.sendToControlPanel("note-navigation-pending");
+  }
+
+  consumePendingNoteNavigation() {
+    const payload = this._pendingNoteNavigation;
+    this._pendingNoteNavigation = null;
     return payload;
   }
 

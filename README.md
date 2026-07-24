@@ -41,12 +41,14 @@ OpenWhispr turns your voice into text, notes, and actions from your desktop. Pre
 ## Features
 
 - **Voice dictation** — global hotkey to dictate into any app with automatic pasting
-- **AI agent** — talk to GPT-5, Claude, Gemini, Groq, or local models with a named voice assistant
+- **Dictation translation** — dedicated hotkey to dictate in one language and paste the text in another
+- **AI agent** — talk to GPT-5, Claude, Gemini, Groq, Tinfoil, OpenRouter, or local models with a named voice assistant
 - **Voice agent hotkey** — dedicated hotkey that sends your dictation straight to your AI agent as a command, no wake word needed and no cleanup pass
 - **Meeting transcription** — auto-detect Zoom, Teams, and FaceTime calls with live speaker diarization, voice fingerprinting, and Google Calendar integration
 - **Local speaker diarization** — on-device speaker labelling with voice fingerprint recognition across meetings, no cloud required
 - **Notes** — create, organize, and search notes with folders, semantic search, cloud sync, and AI actions
-- **Local or cloud — your choice** — all core features (transcription, AI reasoning, speaker diarization, semantic search) work with local models or cloud providers
+- **Audio import** — transcribe existing audio and video: drag in files, batch-upload, or paste a YouTube/audio URL, with optional speaker detection
+- **Local or cloud — your choice** — all core features (transcription, AI reasoning, speaker diarization, semantic search) work with local models or cloud providers — including GPU-accelerated local Whisper on Metal, CUDA, and Vulkan (AMD/Intel)
 - **Public API & MCP** — manage notes and transcriptions programmatically or connect your AI assistant via the [MCP server](https://docs.openwhispr.com/integrations/mcp)
 
 ## Quick start
@@ -69,6 +71,10 @@ Visit **[docs.openwhispr.com](https://docs.openwhispr.com)** for:
 - [API reference](https://docs.openwhispr.com/api/overview)
 - [MCP server setup](https://docs.openwhispr.com/integrations/mcp)
 - [Troubleshooting](https://docs.openwhispr.com/troubleshooting)
+
+Repo examples:
+
+- [Custom ASR shim](examples/custom-asr-shim/) for Self-Hosted transcription against non-OpenAI-compatible ASR APIs
 
 ## Tech stack
 

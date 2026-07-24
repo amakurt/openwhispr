@@ -270,6 +270,7 @@ const WhisperManager = require("./src/helpers/whisper");
 const ParakeetManager = require("./src/helpers/parakeet");
 const DiarizationManager = require("./src/helpers/diarization");
 const TrayManager = require("./src/helpers/tray");
+const dockManager = require("./src/helpers/dockManager");
 const IPCHandlers = require("./src/helpers/ipcHandlers");
 const CliBridge = require("./src/helpers/cliBridge");
 const UpdateManager = require("./src/updater");
@@ -279,11 +280,13 @@ const WindowsKeyManager = require("./src/helpers/windowsKeyManager");
 const LinuxKeyManager = require("./src/helpers/linuxKeyManager");
 const TextEditMonitor = require("./src/helpers/textEditMonitor");
 const WhisperCudaManager = require("./src/helpers/whisperCudaManager");
+const WhisperVulkanManager = require("./src/helpers/whisperVulkanManager");
 const GoogleCalendarManager = require("./src/helpers/googleCalendarManager");
 const MeetingProcessDetector = require("./src/helpers/meetingProcessDetector");
 const AudioActivityDetector = require("./src/helpers/audioActivityDetector");
 const AudioTapManager = require("./src/helpers/audioTapManager");
 const LinuxPortalAudioManager = require("./src/helpers/linuxPortalAudioManager");
+const WindowsLoopbackAudioManager = require("./src/helpers/windowsLoopbackAudioManager");
 const MeetingAecManager = require("./src/helpers/meetingAecManager");
 const MeetingDetectionEngine = require("./src/helpers/meetingDetectionEngine");
 const { i18nMain, changeLanguage } = require("./src/helpers/i18nMain");
@@ -308,16 +311,23 @@ let windowsKeyManager = null;
 let linuxKeyManager = null;
 let textEditMonitor = null;
 let whisperCudaManager = null;
+let whisperVulkanManager = null;
 let googleCalendarManager = null;
 let meetingDetectionEngine = null;
 let audioTapManager = null;
 let linuxPortalAudioManager = null;
+let windowsLoopbackAudioManager = null;
 let meetingAecManager = null;
 let qdrantManager = null;
 let ipcHandlers = null;
 let cliBridge = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
+let pendingNoteCloudId = null;
+let pendingNoteRetryTimer = null;
+let pendingNoteRetryCount = 0;
+const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
+let wakeRewarmTimer = null;
 
 function parseAuthBridgePort() {
   const raw = (process.env.OPENWHISPR_AUTH_BRIDGE_PORT || "").trim();
@@ -387,6 +397,7 @@ function initializeCoreManagers() {
   whisperManager = new WhisperManager();
   if (process.platform !== "darwin") {
     whisperCudaManager = new WhisperCudaManager();
+    whisperVulkanManager = new WhisperVulkanManager();
   }
   parakeetManager = new ParakeetManager();
   diarizationManager = new DiarizationManager();
@@ -399,6 +410,7 @@ function initializeCoreManagers() {
     databaseManager
   );
   windowManager.meetingDetectionEngine = meetingDetectionEngine;
+  googleCalendarManager.meetingDetectionEngine = meetingDetectionEngine;
   updateManager = new UpdateManager();
   updateManager.setWindowManager(windowManager);
   windowsKeyManager = new WindowsKeyManager();
@@ -406,6 +418,10 @@ function initializeCoreManagers() {
   textEditMonitor = new TextEditMonitor();
   audioTapManager = new AudioTapManager();
   linuxPortalAudioManager = new LinuxPortalAudioManager();
+  windowsLoopbackAudioManager = new WindowsLoopbackAudioManager();
+  // Warm the capability cache off the hot path so the first meeting start
+  // doesn't pay the probe spawn. No-ops on non-Windows.
+  windowsLoopbackAudioManager.getCapability().catch(() => {});
   cleanupOrphanedLinuxRestoreToken();
   meetingAecManager = new MeetingAecManager();
   windowManager.textEditMonitor = textEditMonitor;
@@ -426,10 +442,12 @@ function initializeCoreManagers() {
     linuxKeyManager,
     textEditMonitor,
     whisperCudaManager,
+    whisperVulkanManager,
     googleCalendarManager,
     meetingDetectionEngine,
     audioTapManager,
     linuxPortalAudioManager,
+    windowsLoopbackAudioManager,
     meetingAecManager,
     getTrayManager: () => trayManager,
     oauthProtocolRegistered: protocolRegistered,
@@ -502,7 +520,12 @@ app.on("open-url", (event, url) => {
     return;
   }
 
-  if (url.includes("/invitations/")) {
+  if (isNoteDeepLink(url)) {
+    void handleNoteDeepLink(url);
+    return;
+  }
+
+  if (isInvitationDeepLink(url)) {
     handleInvitationDeepLink(url);
     return;
   }
@@ -512,8 +535,86 @@ app.on("open-url", (event, url) => {
   if (windowManager && isLiveWindow(windowManager.controlPanelWindow)) {
     windowManager.controlPanelWindow.show();
     windowManager.controlPanelWindow.focus();
+    dockManager.setControlPanelVisible(true);
   }
 });
+
+function isInvitationDeepLink(url) {
+  return url.slice(`${OAUTH_PROTOCOL}://`.length).startsWith("invitations/");
+}
+
+function isNoteDeepLink(url) {
+  return url.slice(`${OAUTH_PROTOCOL}://`.length).startsWith("notes/");
+}
+
+function parseNoteCloudId(deepLinkUrl) {
+  try {
+    const match = deepLinkUrl.match(/notes\/([^/?#]+)/);
+    const cloudId = match?.[1] ? decodeURIComponent(match[1]) : "";
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cloudId)
+      ? cloudId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingNoteDeepLink() {
+  clearTimeout(pendingNoteRetryTimer);
+  pendingNoteRetryTimer = null;
+  pendingNoteCloudId = null;
+  pendingNoteRetryCount = 0;
+}
+
+async function flushPendingNoteDeepLink() {
+  if (!pendingNoteCloudId || !windowManager || !databaseManager) return;
+
+  try {
+    // Surface the panel on the first attempt only; retries just poll the
+    // database so they can't repeatedly steal focus.
+    if (pendingNoteRetryCount === 0) {
+      await windowManager.createControlPanelWindow();
+    }
+
+    const note = databaseManager.getNoteByCloudId(pendingNoteCloudId);
+    if (!note) {
+      // Cloud sync may still be hydrating during a cold launch. Retry briefly so
+      // the handoff can resolve a note pulled after the protocol event arrived.
+      pendingNoteRetryCount += 1;
+      if (pendingNoteRetryCount <= 10) {
+        clearTimeout(pendingNoteRetryTimer);
+        pendingNoteRetryTimer = setTimeout(() => {
+          void flushPendingNoteDeepLink();
+        }, 1000);
+      } else {
+        console.warn("Note deep link could not resolve a local note", {
+          cloudId: pendingNoteCloudId,
+        });
+        clearPendingNoteDeepLink();
+      }
+      return;
+    }
+
+    const payload = { noteId: note.id, folderId: note.folder_id ?? null };
+    clearPendingNoteDeepLink();
+    await windowManager.queueNoteNavigation(payload);
+  } catch (error) {
+    console.error("Note deep link failed:", error);
+    clearPendingNoteDeepLink();
+  }
+}
+
+async function handleNoteDeepLink(deepLinkUrl) {
+  const cloudId = parseNoteCloudId(deepLinkUrl);
+  if (!cloudId) {
+    console.warn("Invalid note deep link");
+    return;
+  }
+
+  clearPendingNoteDeepLink();
+  pendingNoteCloudId = cloudId;
+  await flushPendingNoteDeepLink();
+}
 
 function handleInvitationDeepLink(deepLinkUrl) {
   try {
@@ -523,6 +624,7 @@ function handleInvitationDeepLink(deepLinkUrl) {
     if (windowManager && isLiveWindow(windowManager.controlPanelWindow)) {
       windowManager.controlPanelWindow.show();
       windowManager.controlPanelWindow.focus();
+      dockManager.setControlPanelVisible(true);
       windowManager.controlPanelWindow.webContents.send("workspace-invitation-token", token);
     } else if (windowManager) {
       windowManager.createControlPanelWindow();
@@ -639,6 +741,7 @@ async function applySessionTokenAndRefresh(token) {
   }
   windowManager.controlPanelWindow.show();
   windowManager.controlPanelWindow.focus();
+  dockManager.setControlPanelVisible(true);
 }
 
 async function handleOAuthDeepLink(deepLinkUrl) {
@@ -665,6 +768,7 @@ function handleUpgradeDeepLink() {
     );
     windowManager.controlPanelWindow.show();
     windowManager.controlPanelWindow.focus();
+    dockManager.setControlPanelVisible(true);
   }
 }
 
@@ -825,9 +929,7 @@ async function startApp() {
     environmentManager.savePanelStartPosition(position);
   });
 
-  if (process.platform === "darwin") {
-    app.setActivationPolicy("regular");
-  }
+  dockManager.init();
 
   // In development, wait for Vite dev server to be ready
   if (process.env.NODE_ENV === "development") {
@@ -840,6 +942,13 @@ async function startApp() {
   await windowManager.createMainWindow();
   if (!startMinimized) {
     await windowManager.createControlPanelWindow();
+  }
+
+  const initialProtocolUrl = process.argv.find((arg) => arg.startsWith(`${OAUTH_PROTOCOL}://`));
+  if (initialProtocolUrl && isNoteDeepLink(initialProtocolUrl)) {
+    await handleNoteDeepLink(initialProtocolUrl);
+  } else {
+    await flushPendingNoteDeepLink();
   }
 
   // Create agent window (hidden) and set up agent hotkey
@@ -882,6 +991,29 @@ async function startApp() {
     }
   }
 
+  // Set up translation hotkey (dictation cleaned up and translated into the
+  // configured target language before pasting)
+  const translationHotkeyCallback = () => {
+    windowManager.sendToggleTranslation();
+  };
+  windowManager._translationHotkeyCallback = translationHotkeyCallback;
+
+  const savedTranslationKey = environmentManager.getTranslationKey?.() || "";
+  if (savedTranslationKey) {
+    const result = await hotkeyManager.registerSlot(
+      "translation",
+      savedTranslationKey,
+      translationHotkeyCallback
+    );
+    if (!result.success) {
+      debugLogger.warn(
+        "Failed to restore translation hotkey",
+        { hotkey: savedTranslationKey },
+        "hotkey"
+      );
+    }
+  }
+
   // Set up meeting mode hotkey
   const meetingHotkeyCallback = () => {
     if (hotkeyManager.isInListeningMode()) return;
@@ -905,7 +1037,9 @@ async function startApp() {
 
   ipcMain.handle("register-meeting-hotkey", async (_event, hotkey) => {
     if (hotkey) {
-      const result = await hotkeyManager.registerSlot("meeting", hotkey, meetingHotkeyCallback);
+      const result = await hotkeyManager.registerSlot("meeting", hotkey, meetingHotkeyCallback, {
+        atomic: true,
+      });
       windowManager.reconcileNativeKeyListeners();
       if (result.success) {
         environmentManager.saveMeetingKey(hotkey);
@@ -932,13 +1066,26 @@ async function startApp() {
     if (googleCalendarManager) {
       googleCalendarManager.onWakeFromSleep();
     }
+    // Sleep evicts the local GPU model from VRAM; reload it once the driver settles. See #766.
+    if (wakeRewarmTimer) clearTimeout(wakeRewarmTimer);
+    wakeRewarmTimer = setTimeout(() => {
+      wakeRewarmTimer = null;
+      whisperManager?.onWakeFromSleep().catch((err) => {
+        debugLogger.debug("whisper wake re-warm error (non-fatal)", { error: err.message });
+      });
+    }, WHISPER_WAKE_REWARM_DELAY_MS);
   });
 
-  // Non-blocking server pre-warming
+  // Non-blocking server pre-warming. CUDA wins when both GPU backends are enabled.
+  const useCuda = process.env.WHISPER_CUDA_ENABLED === "true" && whisperCudaManager?.isDownloaded();
   const whisperSettings = {
     localTranscriptionProvider: process.env.LOCAL_TRANSCRIPTION_PROVIDER || "",
     whisperModel: process.env.LOCAL_WHISPER_MODEL,
-    useCuda: process.env.WHISPER_CUDA_ENABLED === "true" && whisperCudaManager?.isDownloaded(),
+    useCuda,
+    useVulkan:
+      !useCuda &&
+      process.env.WHISPER_VULKAN_ENABLED === "true" &&
+      whisperVulkanManager?.isDownloaded(),
   };
   whisperManager.initializeAtStartup(whisperSettings).catch((err) => {
     debugLogger.debug("Whisper startup init error (non-fatal)", { error: err.message });
@@ -1024,7 +1171,6 @@ async function startApp() {
   trayManager.setCreateControlPanelCallback(() => windowManager.createControlPanelWindow());
   await trayManager.createTray();
 
-  updateManager.setWindows(windowManager.mainWindow, windowManager.controlPanelWindow);
   updateManager.checkForUpdatesOnStartup();
 
   if (process.platform === "darwin") {
@@ -1049,8 +1195,9 @@ async function startApp() {
         windowManager.controlPanelWindow.webContents.send("globe-key-pressed");
       }
 
-      // Handle dictation if Globe/Fn is the current hotkey
-      if (isGlobeLikeHotkey(currentHotkey)) {
+      // Handle dictation if Globe/Fn is one of the dictation hotkeys
+      const dictationUsesGlobe = hotkeyManager.getSlotHotkeys("dictation").some(isGlobeLikeHotkey);
+      if (dictationUsesGlobe) {
         if (mainWindowLive) {
           // Capture target app PID BEFORE showing the overlay
           if (textEditMonitor) textEditMonitor.captureTargetPid();
@@ -1081,17 +1228,23 @@ async function startApp() {
       }
 
       // Check agent and voice agent slots for Globe/Fn key
-      const agentHotkey = hotkeyManager.getSlotHotkey("agent");
-      const voiceAgentHotkey = hotkeyManager.getSlotHotkey("voiceAgent");
-      const agentUsesGlobe = !!agentHotkey && isGlobeLikeHotkey(agentHotkey);
-      const voiceAgentUsesGlobe = !!voiceAgentHotkey && isGlobeLikeHotkey(voiceAgentHotkey);
+      const agentUsesGlobe = hotkeyManager.getSlotHotkeys("agent").some(isGlobeLikeHotkey);
+      const voiceAgentUsesGlobe = hotkeyManager
+        .getSlotHotkeys("voiceAgent")
+        .some(isGlobeLikeHotkey);
+      const translationUsesGlobe = hotkeyManager
+        .getSlotHotkeys("translation")
+        .some(isGlobeLikeHotkey);
       if (agentUsesGlobe) {
         windowManager.toggleAgentOverlay();
       }
       if (voiceAgentUsesGlobe) {
         windowManager.sendToggleVoiceAgent();
       }
-      if (!agentUsesGlobe && !voiceAgentUsesGlobe && !isGlobeLikeHotkey(currentHotkey)) {
+      if (translationUsesGlobe) {
+        windowManager.sendToggleTranslation();
+      }
+      if (!agentUsesGlobe && !voiceAgentUsesGlobe && !translationUsesGlobe && !dictationUsesGlobe) {
         debugLogger?.debug("[Globe] Ignored — hotkey is not GLOBE", { currentHotkey });
       }
     });
@@ -1104,7 +1257,7 @@ async function startApp() {
         windowManager.controlPanelWindow.webContents.send("globe-key-released");
       }
 
-      if (hotkeyManager.getCurrentHotkey && isGlobeLikeHotkey(hotkeyManager.getCurrentHotkey())) {
+      if (hotkeyManager.getSlotHotkeys("dictation").some(isGlobeLikeHotkey)) {
         const activationMode = windowManager.getActivationMode();
         if (activationMode === "push") {
           globeKeyDownTime = 0;
@@ -1121,6 +1274,27 @@ async function startApp() {
       windowManager.handleMacPushModifierUp("fn");
     });
 
+    // Another key was pressed while Fn was held — user is using Fn as a
+    // navigation modifier (Fn+Arrow → Home, Fn+Backspace → Forward Delete, etc.).
+    // Cancel any bare-Fn push-to-talk in progress instead of transcribing noise.
+    // Only the bare-Fn path uses globeKeyDownTime/globeKeyIsRecording, so compound
+    // Fn-hotkey push-to-talk and tap mode are untouched.
+    globeKeyManager.on("globe-interrupted", () => {
+      if (globeKeyDownTime === 0 && !globeKeyIsRecording) {
+        return;
+      }
+      const wasRecording = globeKeyIsRecording;
+      debugLogger?.debug("[Globe] Fn+key interrupted push-to-talk", { wasRecording });
+      globeKeyDownTime = 0;
+      globeKeyIsRecording = false;
+      globeLastStopTime = Date.now();
+      if (wasRecording) {
+        windowManager.sendCancelDictation();
+      } else {
+        windowManager.hideDictationPanel();
+      }
+    });
+
     globeKeyManager.on("modifier-up", (modifier) => {
       if (windowManager?.handleMacPushModifierUp) {
         windowManager.handleMacPushModifierUp(modifier);
@@ -1131,28 +1305,32 @@ async function startApp() {
     let rightModDownTime = 0;
     let rightModIsRecording = false;
     let rightModLastStopTime = 0;
+    let rightModActiveKey = null;
 
     globeKeyManager.on("right-modifier-down", async (modifier) => {
-      const currentHotkey = hotkeyManager.getCurrentHotkey && hotkeyManager.getCurrentHotkey();
-
       // Check agent and voice agent slots for right-modifier
-      if (hotkeyManager.getSlotHotkey("agent") === modifier) {
+      if (hotkeyManager.slotHasHotkey("agent", modifier)) {
         windowManager.toggleAgentOverlay();
       }
-      if (hotkeyManager.getSlotHotkey("voiceAgent") === modifier) {
+      if (hotkeyManager.slotHasHotkey("voiceAgent", modifier)) {
         windowManager.sendToggleVoiceAgent();
       }
+      if (hotkeyManager.slotHasHotkey("translation", modifier)) {
+        windowManager.sendToggleTranslation();
+      }
 
-      if (currentHotkey !== modifier) return;
+      if (!hotkeyManager.slotHasHotkey("dictation", modifier)) return;
       if (!isLiveWindow(windowManager.mainWindow)) return;
 
       const activationMode = windowManager.getActivationMode();
       if (textEditMonitor) textEditMonitor.captureTargetPid();
       if (activationMode === "push") {
+        if (rightModActiveKey && rightModActiveKey !== modifier) return;
         const now = Date.now();
         if (now - rightModLastStopTime < POST_STOP_COOLDOWN_MS) return;
         windowManager.showDictationPanel();
         const pressTime = now;
+        rightModActiveKey = modifier;
         rightModDownTime = pressTime;
         rightModIsRecording = false;
         setTimeout(() => {
@@ -1167,13 +1345,12 @@ async function startApp() {
     });
 
     globeKeyManager.on("right-modifier-up", async (modifier) => {
-      const currentHotkey = hotkeyManager.getCurrentHotkey && hotkeyManager.getCurrentHotkey();
-
-      if (currentHotkey === modifier) {
+      if (hotkeyManager.slotHasHotkey("dictation", modifier)) {
         if (!isLiveWindow(windowManager.mainWindow)) return;
 
         const activationMode = windowManager.getActivationMode();
-        if (activationMode === "push") {
+        if (activationMode === "push" && (!rightModActiveKey || rightModActiveKey === modifier)) {
+          rightModActiveKey = null;
           rightModDownTime = 0;
           rightModLastStopTime = Date.now();
           if (rightModIsRecording) {
@@ -1199,14 +1376,11 @@ async function startApp() {
 
     const syncSuppressedMouseButtons = () => {
       const buttons = [];
-      const currentHotkey = hotkeyManager.getCurrentHotkey && hotkeyManager.getCurrentHotkey();
-      if (isMouseButtonHotkey(currentHotkey)) buttons.push(currentHotkey);
-
-      for (const slotName of ["agent", "voiceAgent"]) {
-        const slotHotkey = hotkeyManager.getSlotHotkey(slotName);
-        if (isMouseButtonHotkey(slotHotkey)) buttons.push(slotHotkey);
+      for (const slotName of ["dictation", "agent", "voiceAgent", "translation"]) {
+        for (const hotkey of hotkeyManager.getSlotHotkeys(slotName)) {
+          if (isMouseButtonHotkey(hotkey)) buttons.push(hotkey);
+        }
       }
-
       globeKeyManager.setSuppressedMouseButtons(buttons);
     };
 
@@ -1214,31 +1388,35 @@ async function startApp() {
     let mouseButtonDownTime = 0;
     let mouseButtonIsRecording = false;
     let mouseButtonLastStopTime = 0;
+    let mouseButtonActiveButton = null;
 
     globeKeyManager.on("mouse-button-down", async (button) => {
       if (hotkeyManager.isInListeningMode && hotkeyManager.isInListeningMode()) return;
       if (!isMouseButtonHotkey(button)) return;
 
-      const currentHotkey = hotkeyManager.getCurrentHotkey && hotkeyManager.getCurrentHotkey();
-
-      if (hotkeyManager.getSlotHotkey("agent") === button) {
+      if (hotkeyManager.slotHasHotkey("agent", button)) {
         windowManager.toggleAgentOverlay();
       }
-      if (hotkeyManager.getSlotHotkey("voiceAgent") === button) {
+      if (hotkeyManager.slotHasHotkey("voiceAgent", button)) {
         windowManager.sendToggleVoiceAgent();
       }
+      if (hotkeyManager.slotHasHotkey("translation", button)) {
+        windowManager.sendToggleTranslation();
+      }
 
-      if (currentHotkey !== button) return;
+      if (!hotkeyManager.slotHasHotkey("dictation", button)) return;
       if (!isLiveWindow(windowManager.mainWindow)) return;
 
       const activationMode = windowManager.getActivationMode();
       if (textEditMonitor) textEditMonitor.captureTargetPid();
 
       if (activationMode === "push") {
+        if (mouseButtonActiveButton && mouseButtonActiveButton !== button) return;
         const now = Date.now();
         if (now - mouseButtonLastStopTime < POST_STOP_COOLDOWN_MS) return;
         windowManager.showDictationPanel();
         const pressTime = now;
+        mouseButtonActiveButton = button;
         mouseButtonDownTime = pressTime;
         mouseButtonIsRecording = false;
         setTimeout(() => {
@@ -1256,12 +1434,15 @@ async function startApp() {
       if (hotkeyManager.isInListeningMode && hotkeyManager.isInListeningMode()) return;
       if (!isMouseButtonHotkey(button)) return;
 
-      const currentHotkey = hotkeyManager.getCurrentHotkey && hotkeyManager.getCurrentHotkey();
-      if (currentHotkey !== button) return;
+      if (!hotkeyManager.slotHasHotkey("dictation", button)) return;
       if (!isLiveWindow(windowManager.mainWindow)) return;
 
       const activationMode = windowManager.getActivationMode();
-      if (activationMode === "push") {
+      if (
+        activationMode === "push" &&
+        (!mouseButtonActiveButton || mouseButtonActiveButton === button)
+      ) {
+        mouseButtonActiveButton = null;
         mouseButtonDownTime = 0;
         mouseButtonLastStopTime = Date.now();
         if (mouseButtonIsRecording) {
@@ -1336,34 +1517,36 @@ async function startApp() {
     // Dictation supports push-to-talk and needs the overlay window; agent/meeting
     // drive other windows (matching their globalShortcut callbacks and macOS).
     const dispatchNativeKeyDown = (key) => {
-      if (key === hotkeyManager.getCurrentHotkey()) {
+      if (hotkeyManager.slotHasHotkey("dictation", key)) {
         if (!isLiveWindow(windowManager.mainWindow)) return;
         if (windowManager.getActivationMode() === "push") {
-          windowManager.startWindowsPushToTalk();
+          windowManager.startWindowsPushToTalk(key);
         } else {
           windowManager.sendToggleDictation();
         }
         return;
       }
-      if (key === hotkeyManager.getSlotHotkey("voiceAgent")) {
+      if (hotkeyManager.slotHasHotkey("voiceAgent", key)) {
         windowManager.sendToggleVoiceAgent();
-      } else if (key === hotkeyManager.getSlotHotkey("agent")) {
+      } else if (hotkeyManager.slotHasHotkey("translation", key)) {
+        windowManager.sendToggleTranslation();
+      } else if (hotkeyManager.slotHasHotkey("agent", key)) {
         if (!hotkeyManager.isInListeningMode()) windowManager.toggleAgentOverlay();
-      } else if (key === hotkeyManager.getSlotHotkey("meeting")) {
+      } else if (hotkeyManager.slotHasHotkey("meeting", key)) {
         if (!hotkeyManager.isInListeningMode()) meetingDetectionEngine?.startManualMeeting();
       }
     };
 
     // Only dictation drives push-to-talk, so only its key-up matters.
     const dispatchNativeKeyUp = (key) => {
-      if (key !== hotkeyManager.getCurrentHotkey()) return;
+      if (!hotkeyManager.slotHasHotkey("dictation", key)) return;
       if (windowManager.winPushState?.active) {
-        windowManager.handleWindowsPushKeyUp();
+        windowManager.handleWindowsPushKeyUp(key);
       } else if (
         isLiveWindow(windowManager.mainWindow) &&
         windowManager.getActivationMode() === "push"
       ) {
-        windowManager.handleWindowsPushKeyUp();
+        windowManager.handleWindowsPushKeyUp(key);
       }
     };
 
@@ -1443,6 +1626,7 @@ if (gotSingleInstanceLock) {
       }
       windowManager.controlPanelWindow.show();
       windowManager.controlPanelWindow.focus();
+      dockManager.setControlPanelVisible(true);
       if (windowManager.controlPanelWindow.webContents.isCrashed()) {
         windowManager.loadControlPanel();
       }
@@ -1461,7 +1645,9 @@ if (gotSingleInstanceLock) {
     if (url) {
       if (url.includes("upgrade-success")) {
         handleUpgradeDeepLink();
-      } else if (url.includes("/invitations/")) {
+      } else if (isNoteDeepLink(url)) {
+        await handleNoteDeepLink(url);
+      } else if (isInvitationDeepLink(url)) {
         handleInvitationDeepLink(url);
       } else {
         void handleOAuthDeepLink(url);
@@ -1481,9 +1667,21 @@ if (gotSingleInstanceLock) {
     .then(() => {
       if (process.platform === "win32") {
         session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-          desktopCapturer.getSources({ types: ["screen"] }).then((sources) => {
-            callback({ video: sources[0], audio: "loopback" });
-          });
+          // Only the loopback audio track is used; the video source is
+          // discarded by the renderer, so skip thumbnail generation.
+          desktopCapturer
+            .getSources({ types: ["screen"], thumbnailSize: { width: 0, height: 0 } })
+            .then((sources) => {
+              if (sources.length > 0) {
+                callback({ video: sources[0], audio: "loopback" });
+              } else {
+                callback(null);
+              }
+            })
+            .catch((error) => {
+              console.error("Display media request failed:", error);
+              callback(null);
+            });
         });
       }
 
@@ -1529,15 +1727,12 @@ if (gotSingleInstanceLock) {
     } else {
       // Show control panel when dock icon is clicked (most common user action)
       if (windowManager && isLiveWindow(windowManager.controlPanelWindow)) {
-        // Ensure dock icon is visible when control panel opens
-        if (process.platform === "darwin" && app.dock) {
-          app.dock.show();
-        }
         if (windowManager.controlPanelWindow.isMinimized()) {
           windowManager.controlPanelWindow.restore();
         }
         windowManager.controlPanelWindow.show();
         windowManager.controlPanelWindow.focus();
+        dockManager.setControlPanelVisible(true);
       } else if (windowManager) {
         // If control panel doesn't exist, create it
         windowManager.createControlPanelWindow();
@@ -1554,6 +1749,13 @@ if (gotSingleInstanceLock) {
   app.on("before-quit", (event) => {
     if (isShuttingDown) return;
     isShuttingDown = true;
+    if (updateManager && updateManager.isQuittingForUpdate) {
+      // Quit must proceed for the installer to run, so no preventDefault;
+      // sidecar shutdown is best-effort (the reaper cleans up orphans on relaunch).
+      performSyncTeardown();
+      sidecarRegistry.shutdownAll().catch(() => {});
+      return;
+    }
     event.preventDefault();
     performSyncTeardown();
     sidecarRegistry.shutdownAll().finally(() => app.exit(0));
@@ -1561,6 +1763,11 @@ if (gotSingleInstanceLock) {
 }
 
 function performSyncTeardown() {
+  if (wakeRewarmTimer) {
+    clearTimeout(wakeRewarmTimer);
+    wakeRewarmTimer = null;
+  }
+  clearPendingNoteDeepLink();
   if (authBridgeServer) {
     authBridgeServer.close();
     authBridgeServer = null;
@@ -1587,6 +1794,7 @@ function performSyncTeardown() {
   if (googleCalendarManager) googleCalendarManager.stop();
   if (audioTapManager) audioTapManager.stop().catch(() => {});
   if (linuxPortalAudioManager) linuxPortalAudioManager.stop().catch(() => {});
+  if (windowsLoopbackAudioManager) windowsLoopbackAudioManager.stop().catch(() => {});
   if (meetingAecManager) meetingAecManager.stop().catch(() => {});
   if (ipcHandlers) ipcHandlers._cleanupTextEditMonitor();
   if (textEditMonitor) textEditMonitor.stopMonitoring();

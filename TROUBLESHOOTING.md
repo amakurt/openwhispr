@@ -102,6 +102,8 @@
 4. Clear model cache: `rm -rf ~/.cache/openwhispr/whisper-models`
 5. Try cloud transcription as fallback
 
+**GPU acceleration (CUDA / Vulkan):** If the GPU-accelerated whisper-server crashes at startup (unsupported GPU, out of VRAM), OpenWhispr automatically restarts it on CPU, retries the same request, and shows a "using CPU instead" notice — the dictation still completes. GPU acceleration can be toggled off from the GPU card in the transcription model picker.
+
 ### Wayland Clipboard Issues (Linux)
 
 **Symptoms:** Paste simulation succeeds but target app shows "clipboard is empty", "no image on clipboard", or "contents not available in the requested format"
@@ -144,12 +146,18 @@ OpenWhispr tries clipboard methods in order: `wl-copy` (most reliable) → rende
 2. Restart the app after granting permission
 3. Ensure Google Calendar is connected in Integrations
 
+**Windows:**
+
+1. System audio is captured by `windows-system-audio-helper.exe` (WASAPI process loopback), which hears every app on every output device — no permission prompt is needed
+2. If the helper is missing or fails (requires Windows 10 2004+), OpenWhispr automatically falls back to Chromium loopback, which only hears the _default_ output device — make sure your meeting app plays through the default device in that case
+3. If transcription shows "Continuing with microphone only", system audio capture failed entirely; check debug logs for `windows-system-audio-helper` entries
+
 **All Platforms:**
 
 1. Check that meeting detection is enabled in settings
 2. Verify your OpenAI API key is valid (required for Realtime API transcription)
 3. Ensure your meeting app (Zoom, Teams, FaceTime) is running — process detection looks for known meeting applications
-4. If auto-detection fails, you can manually start recording from the meeting notification
+4. If auto-detection fails, you can manually start recording from the in-app meeting prompt (an always-on-top overlay card — it works even with Focus/Do Not Disturb on and never appears in screen shares)
 
 ### Agent Mode Issues
 
@@ -182,6 +190,10 @@ Right-click OpenWhispr → Run as administrator (or set permanently in Propertie
 **Firewall blocking cloud mode:**
 
 Allow OpenWhispr through Windows Firewall when using cloud transcription providers.
+
+**Firewall prompt for sherpa-onnx (local Parakeet transcription):**
+
+Windows may ask whether to allow `sherpa-onnx-ws-win32-x64` on public and private networks the first time local Parakeet transcription starts. The bundled sherpa-onnx server only serves OpenWhispr itself over `127.0.0.1`, but it has no loopback-only bind option, so Windows sees it listening on all interfaces. Either choice is safe — Windows never filters loopback traffic, so transcription works even if you click Cancel. All-users installs register a firewall rule that blocks outside access and suppresses the prompt entirely; per-user and portable builds may still see it once.
 
 **Complete reset (after uninstalling):**
 

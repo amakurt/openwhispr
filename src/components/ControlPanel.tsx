@@ -1,7 +1,16 @@
 import React, { Suspense, useState, useEffect, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
-import { Download, RefreshCw, Loader2, AlertTriangle, Zap, ChevronLeft } from "lucide-react";
+import {
+  Download,
+  RefreshCw,
+  Loader2,
+  AlertTriangle,
+  Zap,
+  ChevronLeft,
+  PanelLeftOpen,
+  PanelLeftClose,
+} from "lucide-react";
 import UpgradePrompt from "./UpgradePrompt";
 import PostMigrationOnboarding from "./PostMigrationOnboarding";
 import { ConfirmDialog, AlertDialog } from "./ui/dialog";
@@ -12,6 +21,7 @@ import { useUpdater } from "../hooks/useUpdater";
 import { useSettings } from "../hooks/useSettings";
 import { useAuth } from "../hooks/useAuth";
 import { useUsage } from "../hooks/useUsage";
+import { useCollapsibleSidebar } from "../hooks/useCollapsibleSidebar";
 import {
   useTranscriptions,
   useShowDiscarded,
@@ -40,9 +50,11 @@ import {
   initializeNotes,
 } from "../stores/noteStore";
 import { fetchProviders as fetchStreamingProviders } from "../stores/streamingProvidersStore";
+import { executeTranslationChain, shouldRunTranslateStep } from "../helpers/translationChain";
 import HistoryView from "./HistoryView";
 import BackgroundActionToastListener from "./notes/BackgroundActionToastListener";
 import { syncService } from "../services/SyncService.js";
+import logger from "../utils/logger";
 import AcceptInvitationModal from "./AcceptInvitationModal";
 import {
   consumePendingInvitationToken,
@@ -51,6 +63,11 @@ import {
 import { WORKSPACES_ENABLED } from "../lib/features";
 
 const platform = getCachedPlatform();
+
+const SIDEBAR_WIDTH_PX = 192;
+
+const toggleIconClass =
+  "text-foreground/60 group-hover:text-foreground/75 dark:text-foreground/50 dark:group-hover:text-foreground/65 transition-colors duration-150";
 
 const SettingsModal = React.lazy(() => import("./SettingsModal"));
 const ReferralModal = React.lazy(() => import("./ReferralModal"));
@@ -87,6 +104,14 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   const showDiscarded = useShowDiscarded();
   const [showCloudMigrationBanner, setShowCloudMigrationBanner] = useState(false);
   const [activeView, setActiveView] = useState<ControlPanelView>("home");
+  const {
+    collapsed: sidebarCollapsed,
+    peek: sidebarPeek,
+    toggle: toggleSidebar,
+    showPeek: showSidebarPeek,
+    hidePeek: hideSidebarPeek,
+    leaveToggle: leaveSidebarToggle,
+  } = useCollapsibleSidebar();
   const isMeetingMode = useIsMeetingMode();
   const isNarrowWindow = useIsNarrowWindow();
   const activeNoteId = useActiveNoteId();
@@ -99,9 +124,12 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
     folderId: number;
     event: any;
   } | null>(null);
-  const [gpuAccelAvailable, setGpuAccelAvailable] = useState<{ cuda: boolean; vulkan: boolean }>({
-    cuda: false,
-    vulkan: false,
+  const [gpuAccelAvailable, setGpuAccelAvailable] = useState<{
+    transcription: boolean;
+    intelligence: boolean;
+  }>({
+    transcription: false,
+    intelligence: false,
   });
   const [gpuBannerDismissed, setGpuBannerDismissed] = useState(
     () => localStorage.getItem("gpuBannerDismissedUnified") === "true"
@@ -292,11 +320,16 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   useEffect(() => {
     if (platform === "darwin" || gpuBannerDismissed) return;
     const detect = async () => {
-      const results = { cuda: false, vulkan: false };
+      const results = { transcription: false, intelligence: false };
       if (useLocalWhisper && localTranscriptionProvider === "whisper") {
         try {
           const status = await window.electronAPI?.getCudaWhisperStatus?.();
-          if (status?.gpuInfo.hasNvidiaGpu && !status.downloaded) results.cuda = true;
+          if (status?.gpuInfo.hasNvidiaGpu) {
+            if (!status.downloaded) results.transcription = true;
+          } else {
+            const vulkan = await window.electronAPI?.getVulkanWhisperStatus?.();
+            if (vulkan?.vulkan.available && !vulkan.downloaded) results.transcription = true;
+          }
         } catch {}
       }
       if (useCleanupModel) {
@@ -305,7 +338,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
             window.electronAPI?.detectVulkanGpu?.(),
             window.electronAPI?.getLlamaVulkanStatus?.(),
           ]);
-          if (gpu?.available && !vulkan?.downloaded) results.vulkan = true;
+          if (gpu?.available && !vulkan?.downloaded) results.intelligence = true;
         } catch {}
       }
       setGpuAccelAvailable(results);
@@ -339,14 +372,18 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   }, []);
 
   useEffect(() => {
-    const cleanup = window.electronAPI?.onNavigateToNote?.((data) => {
+    const drain = async () => {
+      const data = await window.electronAPI?.getPendingNoteNavigation?.();
+      if (!data) return;
       if (data.folderId) {
         setActiveFolderId(data.folderId);
         initializeNotes(null, 50, data.folderId);
       }
       setActiveNoteId(data.noteId);
       setActiveView("personal-notes");
-    });
+    };
+    drain();
+    const cleanup = window.electronAPI?.onNoteNavigationPending?.(drain);
     return () => cleanup?.();
   }, []);
 
@@ -373,10 +410,6 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
     });
     return () => cleanup?.();
   }, [toast, t]);
-
-  useEffect(() => {
-    syncService.syncAll().catch(console.error);
-  }, []);
 
   useEffect(() => {
     fetchStreamingProviders();
@@ -422,7 +455,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
             const result = await window.electronAPI.deleteTranscription(id);
             if (result.success) {
               removeFromStore(id);
-              syncService.syncAll().catch(console.error);
+              syncService.requestSyncAll("manual");
             } else {
               showAlertDialog({
                 title: t("controlPanel.history.couldNotDeleteTitle"),
@@ -451,7 +484,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
           const result = await window.electronAPI.clearTranscriptions();
           if (result.success) {
             clearStore();
-            syncService.syncAll().catch(console.error);
+            syncService.requestSyncAll("manual");
             toast({
               title: t("controlPanel.history.clearAllSuccess"),
               variant: "success",
@@ -511,13 +544,80 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
           transcriptionMode: s.transcriptionMode,
           remoteTranscriptionType: s.remoteTranscriptionType,
           remoteTranscriptionUrl: s.remoteTranscriptionUrl,
+          remoteTranscriptionModel: s.remoteTranscriptionModel,
         });
         if (result.success && result.transcription) {
           const rawText = result.transcription.text;
           let finalTranscription = result.transcription;
 
+          // A translation dictation must re-run cleanup-then-translate on retry, not plain cleanup.
+          let handledTranslation = false;
+          if (result.transcription.route_kind === "translation") {
+            handledTranslation = true;
+            try {
+              const [
+                { default: ReasoningService },
+                { resolveReasoningRoute },
+                { getEffectiveCleanupModel },
+              ] = await Promise.all([
+                import("../services/ReasoningService"),
+                import("../helpers/audioManager"),
+                import("../stores/settingsStore"),
+              ]);
+              const settings = useSettingsStore.getState();
+              const agentName = localStorage.getItem("agentName") || null;
+              const route = resolveReasoningRoute(rawText, settings, agentName, false, true);
+              if (route.kind === "translation") {
+                const { text } = await executeTranslationChain({
+                  text: rawText,
+                  cleanupReachable: route.cleanupReachable,
+                  runCleanup: (currentText: string) =>
+                    ReasoningService.processText(
+                      currentText,
+                      getEffectiveCleanupModel(),
+                      agentName,
+                      route.cleanupConfig
+                    ),
+                  runTranslate: (currentText: string) =>
+                    ReasoningService.processText(currentText, route.model, agentName, route.config),
+                  shouldTranslate: shouldRunTranslateStep(
+                    settings.translationSourceLanguage,
+                    settings.translationTargetLanguage
+                  ),
+                  onCleanupError: (cleanupError: Error) =>
+                    logger.warn(
+                      "Cleanup step failed in translation chain, translating raw transcript",
+                      { error: cleanupError.message },
+                      "transcription"
+                    ),
+                  onEmptyTranslate: () =>
+                    logger.warn(
+                      "Translation step returned empty text, keeping previous text",
+                      {},
+                      "transcription"
+                    ),
+                });
+                if (text !== rawText) {
+                  const updated = await window.electronAPI.updateTranscriptionText(
+                    id,
+                    text,
+                    rawText
+                  );
+                  if (updated.success && updated.transcription) {
+                    finalTranscription = updated.transcription;
+                  }
+                }
+              } else {
+                // Translation disabled/unreachable since recording — fall through to cleanup.
+                handledTranslation = false;
+              }
+            } catch {
+              // Reasoning failed — keep the raw STT result
+            }
+          }
+
           // Apply AI reasoning if enabled
-          if (useCleanupModel) {
+          if (!handledTranslation && useCleanupModel) {
             try {
               const [
                 { default: ReasoningService },
@@ -734,10 +834,25 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
         </Suspense>
       )}
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative">
         <div
-          className="shrink-0 overflow-hidden transition-[width] duration-300 ease-out"
-          style={{ width: isSidePanelLayout ? 0 : undefined }}
+          className="shrink-0 transition-[width] duration-300 ease-out"
+          style={{ width: sidebarCollapsed || isSidePanelLayout ? 0 : SIDEBAR_WIDTH_PX }}
+        />
+        <div
+          className={`absolute inset-y-0 left-0 z-30 transition-transform duration-300 ease-out${
+            sidebarCollapsed && sidebarPeek && !isSidePanelLayout
+              ? " shadow-[10px_0_40px_-18px_rgba(0,0,0,0.2)]"
+              : ""
+          }`}
+          style={{
+            transform:
+              !isSidePanelLayout && (!sidebarCollapsed || sidebarPeek)
+                ? "translateX(0)"
+                : "translateX(-100%)",
+          }}
+          onMouseEnter={sidebarCollapsed ? showSidebarPeek : undefined}
+          onMouseLeave={sidebarCollapsed ? hideSidebarPeek : undefined}
         >
           <ControlPanelSidebar
             activeView={activeView}
@@ -840,7 +955,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                 </div>
               </div>
             )}
-            {(gpuAccelAvailable.cuda || gpuAccelAvailable.vulkan) &&
+            {(gpuAccelAvailable.transcription || gpuAccelAvailable.intelligence) &&
               activeView === "home" &&
               !gpuBannerDismissed && (
                 <div className="max-w-3xl mx-auto w-full mb-3">
@@ -863,7 +978,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                             className="h-7 text-xs"
                             onClick={() => {
                               setSettingsSection(
-                                gpuAccelAvailable.cuda ? "transcription" : "intelligence"
+                                gpuAccelAvailable.transcription ? "transcription" : "intelligence"
                               );
                               setShowSettings(true);
                             }}
@@ -959,6 +1074,28 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
             )}
           </div>
         </main>
+        {!isSidePanelLayout && (
+          <div
+            className={`absolute z-40 flex h-10 items-center ${
+              platform === "darwin" ? "left-21 top-2" : "left-2 top-0"
+            }`}
+            style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+            onMouseEnter={sidebarCollapsed ? showSidebarPeek : undefined}
+            onMouseLeave={sidebarCollapsed ? leaveSidebarToggle : undefined}
+          >
+            <button
+              onClick={toggleSidebar}
+              aria-label={sidebarCollapsed ? t("sidebar.expand") : t("sidebar.collapse")}
+              className="group flex items-center justify-center h-7 w-7 rounded-md outline-none hover:bg-foreground/5 dark:hover:bg-white/5 focus-visible:ring-1 focus-visible:ring-primary/30 transition-colors duration-150"
+            >
+              {sidebarCollapsed ? (
+                <PanelLeftOpen size={15} className={toggleIconClass} />
+              ) : (
+                <PanelLeftClose size={15} className={toggleIconClass} />
+              )}
+            </button>
+          </div>
+        )}
       </div>
       <BackgroundActionToastListener />
     </div>

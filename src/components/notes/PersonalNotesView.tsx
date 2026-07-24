@@ -58,6 +58,7 @@ import { MEETINGS_FOLDER_NAME, findDefaultFolder } from "./shared";
 import logger from "../../utils/logger";
 import { parseTranscriptSegments } from "../../utils/parseTranscriptSegments";
 import { serializeTranscriptSegments } from "../../utils/transcriptSpeakerState";
+import { resolveExpectedSpeakerCount } from "../../utils/participants";
 import {
   useNotes,
   useActiveNoteId,
@@ -79,6 +80,7 @@ import {
 } from "../../stores/meetingRecordingStore";
 import { useNotesOnboarding } from "../../hooks/useNotesOnboarding";
 import NotesOnboarding from "./NotesOnboarding";
+import { isRegenerableNoteTitle } from "../../helpers/regenerableNoteTitle";
 
 const FOLDER_INPUT_CLASS =
   "w-full h-6 bg-foreground/5 dark:bg-white/5 rounded px-2 text-xs text-foreground outline-none border border-primary/30 focus:border-primary/50";
@@ -150,17 +152,11 @@ export default function PersonalNotesView({
   const { isComplete: isOnboardingComplete, complete: completeOnboarding } = useNotesOnboarding();
 
   const isTranscribing = useMeetingRecordingStore((s) => s.isRecording);
-  const realtimeTranscript = useMeetingRecordingStore((s) => s.transcript);
-  const realtimeSegments = useMeetingRecordingStore((s) => s.segments);
-  const micPartial = useMeetingRecordingStore((s) => s.micPartial);
-  const systemPartial = useMeetingRecordingStore((s) => s.systemPartial);
-  const systemPartialSpeakerId = useMeetingRecordingStore((s) => s.systemPartialSpeakerId);
-  const systemPartialSpeakerName = useMeetingRecordingStore((s) => s.systemPartialSpeakerName);
   const diarizationSessionId = useMeetingRecordingStore((s) => s.diarizationSessionId);
+  const recordingNoteId = useMeetingRecordingStore((s) => s.recordingNoteId);
   const sessionDiarizationEnabled = useMeetingRecordingStore((s) => s.sessionDiarizationEnabled);
   const sessionExpectedCount = useMeetingRecordingStore((s) => s.sessionExpectedCount);
   const userTouchedStepper = useMeetingRecordingStore((s) => s.userTouchedStepper);
-  const recordingNoteId = useMeetingRecordingStore((s) => s.recordingNoteId);
 
   const {
     folders,
@@ -232,7 +228,7 @@ export default function PersonalNotesView({
       folderId: note?.folder_id ?? null,
       seedSegments,
       diarizationEnabled: note?.diarization_enabled == null ? null : note.diarization_enabled === 1,
-      expectedCount: note?.expected_speaker_count ?? null,
+      expectedCount: resolveExpectedSpeakerCount(note),
     });
   }, [notes]);
 
@@ -480,11 +476,22 @@ export default function PersonalNotesView({
     runAction,
   } = useActionProcessing(activeNoteId ?? null);
 
+  // Boolean flag so actions enable during recording without re-rendering on every transcript update.
+  const hasLiveTranscript = useMeetingRecordingStore(
+    (s) => s.recordingNoteId === activeNote?.id && !!s.transcript
+  );
+  const activeNoteRawTranscript = activeNote?.transcript || "";
+
   const isEnhancementStale = useMemo(() => {
     if (!activeNote?.enhanced_content || !activeNote?.enhanced_at_content_hash) return false;
-    const currentHash = makeContentHash(localContent);
+    const currentHash = makeContentHash(`${localContent}\n${activeNoteRawTranscript}`);
     return currentHash !== activeNote.enhanced_at_content_hash;
-  }, [activeNote?.enhanced_content, activeNote?.enhanced_at_content_hash, localContent]);
+  }, [
+    activeNote?.enhanced_content,
+    activeNote?.enhanced_at_content_hash,
+    localContent,
+    activeNoteRawTranscript,
+  ]);
 
   const handleExportNote = useCallback(
     async (format: "md" | "txt") => {
@@ -512,7 +519,7 @@ export default function PersonalNotesView({
       folderId: note?.folder_id ?? meetingRecordingRequest.folderId ?? null,
       seedSegments,
       diarizationEnabled: note?.diarization_enabled == null ? null : note.diarization_enabled === 1,
-      expectedCount: note?.expected_speaker_count ?? null,
+      expectedCount: resolveExpectedSpeakerCount(note),
     });
     onMeetingRecordingRequestHandled?.();
   }, [meetingRecordingRequest, activeNoteId, notes, onMeetingRecordingRequestHandled]);
@@ -520,11 +527,9 @@ export default function PersonalNotesView({
   const prevTranscribingRef = useRef(false);
 
   useEffect(() => {
-    if (
-      prevTranscribingRef.current &&
-      !isTranscribing &&
-      (realtimeTranscript || realtimeSegments.length > 0)
-    ) {
+    if (prevTranscribingRef.current && !isTranscribing) {
+      const { transcript: realtimeTranscript, segments: realtimeSegments } =
+        useMeetingRecordingStore.getState();
       const transcript =
         realtimeSegments.length > 0
           ? serializeTranscriptSegments(realtimeSegments)
@@ -535,20 +540,22 @@ export default function PersonalNotesView({
       }
     }
     prevTranscribingRef.current = isTranscribing;
-  }, [isTranscribing, realtimeTranscript, realtimeSegments, recordingNoteId]);
+  }, [isTranscribing, recordingNoteId]);
 
   useEffect(() => {
     if (!isTranscribing) return;
 
     const interval = setInterval(() => {
-      if (!recordingNoteId || realtimeSegments.length === 0) return;
-      window.electronAPI.updateNote(recordingNoteId, {
+      const { recordingNoteId: currentRecordingNoteId, segments: realtimeSegments } =
+        useMeetingRecordingStore.getState();
+      if (!currentRecordingNoteId || realtimeSegments.length === 0) return;
+      window.electronAPI.updateNote(currentRecordingNoteId, {
         transcript: serializeTranscriptSegments(realtimeSegments),
       });
     }, 30_000);
 
     return () => clearInterval(interval);
-  }, [isTranscribing, realtimeSegments, recordingNoteId]);
+  }, [isTranscribing]);
 
   const isLocalSynced = syncedNoteId === activeNote?.id;
   const isActiveNoteRecording = isTranscribing && recordingNoteId === activeNote?.id;
@@ -943,18 +950,7 @@ export default function PersonalNotesView({
                   : undefined
               }
               diarizationSessionId={diarizationSessionId}
-              meetingTranscript={isActiveNoteRecording ? realtimeTranscript : ""}
-              meetingSegments={isActiveNoteRecording ? realtimeSegments : []}
-              meetingMicPartial={isActiveNoteRecording ? micPartial : ""}
-              meetingSystemPartial={isActiveNoteRecording ? systemPartial : ""}
-              meetingSystemPartialSpeakerId={
-                isActiveNoteRecording ? systemPartialSpeakerId : undefined
-              }
-              meetingSystemPartialSpeakerName={
-                isActiveNoteRecording ? systemPartialSpeakerName : undefined
-              }
               onLiveSpeakerLock={lockSpeaker}
-              liveTranscript={isActiveNoteRecording ? realtimeTranscript : ""}
               sessionDiarizationEnabled={sessionDiarizationEnabled}
               sessionExpectedCount={sessionExpectedCount}
               userTouchedStepper={userTouchedStepper}
@@ -971,7 +967,11 @@ export default function PersonalNotesView({
                 <ActionPicker
                   onRunAction={(action) => {
                     if (!editorNote) return;
-                    const rawTranscript = realtimeTranscript || editorNote.transcript;
+                    const { recordingNoteId: liveNoteId, transcript: liveTranscript } =
+                      useMeetingRecordingStore.getState();
+                    const rawTranscript =
+                      (liveNoteId === activeNote?.id ? liveTranscript : "") ||
+                      activeNoteRawTranscript;
                     const noteContent = editorNote.content;
                     const hasNotes = !!noteContent.trim();
                     if (!hasNotes && !rawTranscript) return;
@@ -1000,17 +1000,26 @@ export default function PersonalNotesView({
                     ]
                       .filter(Boolean)
                       .join("\n\n");
-                    runAction(action, parts, makeContentHash(noteContent), {
+                    runAction(action, parts, makeContentHash(`${noteContent}\n${rawTranscript}`), {
                       isCloudMode,
                       modelId: effectiveModelId,
                       isMeetingNote,
+                      allowTitleGeneration: isRegenerableNoteTitle(
+                        editorNote.title,
+                        [
+                          t("notes.list.untitledNote"),
+                          t("notes.list.newNote"),
+                          t("notes.sidebar.newNote"),
+                        ],
+                        calendarEventName
+                      ),
                     });
                   }}
                   onManageActions={() => setShowActionManager(true)}
                   disabled={
                     (!editorNote?.content?.trim() &&
-                      !realtimeTranscript &&
-                      !activeNote?.transcript) ||
+                      !hasLiveTranscript &&
+                      !activeNoteRawTranscript) ||
                     actionProcessingState === "processing"
                   }
                 />

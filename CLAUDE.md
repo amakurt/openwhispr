@@ -46,6 +46,7 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 
 - **windows-key-listener.c**: C source for Windows low-level keyboard hook (Push-to-Talk)
 - **windows-mic-listener.c**: C source for WASAPI mic session monitor (event-driven mic detection)
+- **windows-system-audio-helper.c**: C source for WASAPI process-loopback system audio capture (meeting transcription). Excludes OpenWhispr's own process tree, so it hears every app on every output device. Requires Windows 10 2004+; falls back to Chromium display-media loopback when unavailable. Outputs 24 kHz mono s16le PCM on stdout, line-delimited JSON events on stderr (same protocol as linux-system-audio-helper)
 - **macos-mic-listener.swift**: Swift source for CoreAudio mic property listener (event-driven mic detection)
 - **globe-listener.swift**: Swift source for macOS Globe/Fn key detection
 - **bin/**: Directory for compiled native binaries (whisper-cpp, nircmd, key/mic listeners)
@@ -60,6 +61,11 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 - **database.js**: SQLite operations for transcription history
 - **debugLogger.js**: Debug logging system with file output
 - **devServerManager.js**: Vite dev server integration
+- **dockManager.js**: Single owner of the macOS Dock icon
+  - The icon follows the control panel: it appears when the panel opens and goes away when the panel closes to the tray, so no other caller (in particular the dictation panel's hide path) can resurrect it
+  - Every path that surfaces or hides the control panel (tray, app menu, deep links, `activate`, `ready-to-show`, `hideControlPanelToTray`) reports that state explicitly
+  - Never derive that state from the window's `show`/`hide` events: on macOS those are occlusion events, so they also fire when the panel is merely covered by another window, minimized, or on another Space, and the icon flickers as the user switches windows
+  - Decision logic lives in `dockPolicy.js` (pure, unit-tested in `test/helpers/dockPolicy.test.js`)
 - **dragManager.js**: Window dragging functionality
 - **environment.js**: Environment variable and OpenAI API management
 - **hotkeyManager.js**: Global hotkey registration and management
@@ -69,16 +75,26 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
   - Notifies renderer via IPC when hotkey registration fails
   - Integrates with GnomeShortcutManager for GNOME Wayland support
   - Integrates with HyprlandShortcutManager for Hyprland Wayland support
+  - Integrates with KDEShortcutManager for KDE Wayland support
 - **gnomeShortcut.js**: GNOME Wayland global shortcut integration
   - Uses D-Bus service to receive hotkey toggle commands
   - Registers shortcuts via gsettings (visible in GNOME Settings → Keyboard → Shortcuts)
   - Converts Electron hotkey format to GNOME keysym format
   - Only active on Linux + Wayland + GNOME desktop
+  - D-Bus transport: `@homebridge/dbus-native` (pure JavaScript, no native addons)
 - **hyprlandShortcut.js**: Hyprland Wayland global shortcut integration
   - Uses D-Bus service to receive hotkey toggle commands (same `com.openwhispr.App` service)
   - Registers shortcuts via `hyprctl keyword bind` (runtime keybinding)
   - Converts Electron hotkey format to Hyprland bind format (`MODS, key`)
   - Only active on Linux + Wayland + Hyprland (detected via `HYPRLAND_INSTANCE_SIGNATURE`)
+  - D-Bus transport: `@homebridge/dbus-native` (pure JavaScript, no native addons)
+- **kdeShortcut.js**: KDE Wayland global shortcut integration
+  - Uses D-Bus to communicate with KGlobalAccel for global hotkey registration
+  - Registers hotkeys via `setShortcut`/`doRegister` D-Bus calls on the KGlobalAccel interface
+  - Listens for `globalShortcutPressed` signals to trigger callbacks
+  - Converts Electron hotkey format to Qt key codes
+  - Only active on Linux + KDE desktop (detected via `XDG_CURRENT_DESKTOP`)
+  - D-Bus transport: `@homebridge/dbus-native` (pure JavaScript, no native addons)
 - **ipcHandlers.js**: Centralized IPC handler registration
 - **windowsKeyManager.js**: Windows Push-to-Talk support with native key listener
   - Spawns native `windows-key-listener.exe` binary for low-level keyboard hooks
@@ -168,6 +184,14 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 - **Available Models**:
   - `parakeet-tdt-0.6b-v3`: Multilingual (25 languages), ~680MB
   - `parakeet-unified-en-0.6b`: English-only, ~631MB, state-of-the-art EN accuracy (5.91% avg WER on Open ASR Leaderboard)
+  - `nemotron-speech-streaming-en-0.6b`: English-only, ~632MB, cache-aware streaming FastConformer (`"runtime": "online"` in the registry)
+  - `nemotron-3.5-asr-streaming-0.6b`: Multilingual (15 transcription-ready languages, auto detection), ~650MB, cache-aware streaming FastConformer (`"runtime": "online"`)
+
+- **Runtimes**: Models are `offline` (default) or `online` per their registry `runtime` field. Offline models use the bundled `sherpa-onnx-ws-{platform}-{arch}` (offline websocket server); online models use `sherpa-onnx-online-ws-{platform}-{arch}` (online websocket server). Both are downloaded by `scripts/download-sherpa-onnx.js`. Partial/final JSON results are merged by `parakeetWsResult.js`.
+
+- **Streaming Commit (online models)**: For online-runtime models, dictation streams worklet PCM to a persistent websocket stream during capture (regardless of the preview toggle) and commits the flushed text at stop as the final transcript — no second decode of the recording. The stop flush is truncation-aware (`finish()` extends its deadline while results keep arriving and flags `truncated`); anything but a clean flush falls back to the record-then-transcribe path (`transcribe-local-parakeet`), which for online models decodes the whole recording over a single stream (no 15s segmentation; segments only bound memory for very long files).
+
+- **Live Transcription Preview**: When the preview toggle is on and an online-runtime model is selected, the preview shares the streaming-commit websocket: partial results update the preview window live (replacing text via `showTranscriptionPreview`). Offline models keep the 1.5s buffered-chunk path (appending via `appendTranscriptionPreview`). If the stream can't start or dies mid-dictation, the preview falls back to the chunked path and the final transcript falls back to the full decode. Tests: `test/helpers/parakeetOnlineStream.test.js` (mock websocket server).
 
 - **Download URLs**: Models from sherpa-onnx ASR models release on GitHub
 
@@ -192,8 +216,8 @@ Always-on offline semantic search that finds notes by meaning, not just keywords
 
 **Storage**:
 
-- Qdrant data: `~/.cache/openwhispr/qdrant-data/`
-- Qdrant binary: `resources/bin/qdrant-{platform}-{arch}` (bundled — downloaded during `prebuild` / `predev`)
+- Qdrant data: `~/.cache/openwhispr/qdrant-data/` (`qdrant-data-dev/` in development)
+- Qdrant binary: `resources/bin/qdrant-{platform}-{arch}` (bundled — downloaded during `prebuild` / `predev:main`)
 - Embedding model: `~/.cache/openwhispr/embedding-models/all-MiniLM-L6-v2/` (auto-downloaded on first launch)
 
 **Dependencies**: `@qdrant/js-client-rest`, `onnxruntime-node`
@@ -389,11 +413,12 @@ The app can open OS-level settings for microphone permissions, sound input selec
 - `open-accessibility-settings`: Opens accessibility privacy settings (macOS only)
 
 **Platform-specific URLs**:
-| Platform | Microphone Privacy | Sound Input | Accessibility |
-|----------|-------------------|-------------|---------------|
-| macOS | `x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone` | `x-apple.systempreferences:com.apple.preference.sound?input` | `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` |
-| Windows | `ms-settings:privacy-microphone` | `ms-settings:sound` | N/A |
-| Linux | Manual (no URL scheme) | Manual (e.g., pavucontrol) | N/A |
+
+| Platform | Microphone Privacy                                                           | Sound Input                                                  | Accessibility                                                                   |
+| -------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| macOS    | `x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone` | `x-apple.systempreferences:com.apple.preference.sound?input` | `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` |
+| Windows  | `ms-settings:privacy-microphone`                                             | `ms-settings:sound`                                          | N/A                                                                             |
+| Linux    | Manual (no URL scheme)                                                       | Manual (e.g., pavucontrol)                                   | N/A                                                                             |
 
 **UI Component** (`MicPermissionWarning.tsx`):
 
@@ -549,13 +574,21 @@ Detects meetings via three independent sources, orchestrated by `MeetingDetectio
 - Linux: `pactl subscribe` — PulseAudio source-output events
 - All platforms: Graceful fallback to polling if native binary/command unavailable
 
+**Calendar Reminders** (scheduled meetings):
+
+- `GoogleCalendarManager` fires `meetingDetectionEngine.handleCalendarReminder(event)` 1 minute before the scheduled start (`MEETING_REMINDER_LEAD_MS`) — no native OS notifications; all meeting prompts use the in-app overlay so they survive Focus/DND and screen-share notification muting
+- Calendar-sourced prompts show a Join primary action when the event has a meeting link (`getMeetingJoinUrl` in `src/helpers/meetingJoinUrl.js`, shared with the renderer's Upcoming Meetings join button) — Join opens the link and starts the note
+
 **UX Rules**:
 
+- All prompts render in one always-on-top overlay window (`MeetingNotificationCard`), content-protected so it never appears in screen shares
+- Prompt copy is derived in the renderer from `{ variant, event, joinUrl }` (`meetingNotification.*` i18n keys); variants: `detected` (mic evidence), `starting` (calendar event not yet started), `underway` (event in progress)
+- Per-source notification prefs: `notifyCalendarReminders` gates calendar prompts, `notifyMeetingDetection` gates mic/process prompts
 - During recording (tap-to-talk or push-to-talk): ALL notifications suppressed
 - After recording: 2.5s cooldown before showing queued notifications
-- Multiple signals coalesced: process > audio priority, one notification shown
-- Calendar-aware: if imminent calendar event exists, notification shows event name
-- Active calendar meeting recording: all detections suppressed
+- Multiple signals coalesced: one overlay at a time; a newer prompt replaces the current one
+- Calendar-aware: if an ongoing or imminent calendar event exists, the prompt shows the event name and links the note to the event
+- Active meeting recording (meeting mode): all detections suppressed
 
 **Binary Distribution**:
 
@@ -748,7 +781,7 @@ const { t } = useTranslation();
   - Default fallback: `F8` when `Control+Super` cannot be registered
   - Push-to-talk unavailable (GNOME shortcuts only fire single toggle event)
   - Falls back to X11/globalShortcut if GNOME integration fails
-  - `dbus-next` npm package used for D-Bus communication
+  - D-Bus transport: `@homebridge/dbus-native` (pure JavaScript, no native addons)
 
 ## Code Style and Conventions
 

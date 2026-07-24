@@ -1,3 +1,6 @@
+import type { ModelDefinition } from "../models/ModelRegistry";
+import type { TinfoilCatalogModel } from "../models/tinfoilModels";
+
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
 
 export type InferenceMode = "openwhispr" | "providers" | "local" | "self-hosted" | "enterprise";
@@ -33,6 +36,7 @@ export interface TranscriptionItem {
   status: TranscriptionStatus;
   error_message: string | null;
   error_code: TranscriptionErrorCode;
+  route_kind?: string | null;
   client_transcription_id: string;
   cloud_id: string | null;
   sync_status: "synced" | "pending" | "error";
@@ -107,6 +111,18 @@ export interface DictionaryEntryItem {
   created_at: string;
   updated_at: string;
   client_dict_id: string;
+  cloud_id: string | null;
+  sync_status: "synced" | "pending" | "error";
+  deleted_at: string | null;
+}
+
+export interface SnippetEntryItem {
+  id: number;
+  trigger: string;
+  replacement: string;
+  created_at: string;
+  updated_at: string;
+  client_snippet_id: string;
   cloud_id: string | null;
   sync_status: "synced" | "pending" | "error";
   deleted_at: string | null;
@@ -218,6 +234,7 @@ export interface ActionItem {
 
 export interface GpuDevice {
   index: number;
+  uuid: string;
   name: string;
   vramMb: number;
 }
@@ -231,8 +248,16 @@ export interface GpuInfo {
 
 export interface CudaWhisperStatus {
   downloaded: boolean;
+  downloading: boolean;
   path: string | null;
   gpuInfo: GpuInfo;
+}
+
+export interface VulkanWhisperStatus {
+  downloaded: boolean;
+  downloading: boolean;
+  vulkan: VulkanGpuResult;
+  hasNvidiaGpu: boolean;
 }
 
 export interface WhisperCheckResult {
@@ -248,6 +273,11 @@ export interface WhisperModelResult {
   size_mb?: number;
   error?: string;
   code?: string;
+  isDownloading?: boolean;
+  isInstalling?: boolean;
+  downloadProgress?: number;
+  downloadedBytes?: number;
+  totalBytes?: number;
 }
 
 export interface WhisperModelDeleteResult {
@@ -260,7 +290,7 @@ export interface WhisperModelDeleteResult {
 
 export interface WhisperModelsListResult {
   success: boolean;
-  models: Array<{ model: string; downloaded: boolean; size_mb?: number }>;
+  models: WhisperModelResult[];
   cache_dir: string;
 }
 
@@ -283,7 +313,8 @@ export interface AudioDiagnosticsResult {
 }
 
 export type SystemAudioMode = "native" | "loopback" | "portal" | "unsupported";
-export type SystemAudioStrategy = "native" | "loopback" | "pipewire-loopback" | "unsupported";
+export type SystemAudioStrategy =
+  "native" | "loopback" | "pipewire-loopback" | "wasapi-loopback" | "unsupported";
 
 export interface SystemAudioAccessResult {
   granted: boolean;
@@ -357,6 +388,11 @@ export interface ParakeetModelResult {
   size_mb?: number;
   error?: string;
   code?: string;
+  isDownloading?: boolean;
+  isInstalling?: boolean;
+  downloadProgress?: number;
+  downloadedBytes?: number;
+  totalBytes?: number;
 }
 
 export interface ParakeetModelDeleteResult {
@@ -370,7 +406,7 @@ export interface ParakeetModelDeleteResult {
 
 export interface ParakeetModelsListResult {
   success: boolean;
-  models: Array<{ model: string; downloaded: boolean; size_mb?: number }>;
+  models: ParakeetModelResult[];
   cache_dir: string;
 }
 
@@ -447,6 +483,40 @@ export interface LlamaVulkanDownloadProgress {
   percentage: number;
 }
 
+export interface LocalLLMModelStatus extends ModelDefinition {
+  providerId?: string;
+  providerName?: string;
+  isDownloaded: boolean;
+  isDownloading: boolean;
+  downloadProgress: number;
+  downloadedSize: number;
+  totalSize: number;
+  path: string | null;
+}
+
+export type LocalLLMDownloadProgressEvent =
+  | {
+      type?: "progress";
+      modelId: string;
+      progress: number;
+      downloadedSize: number;
+      totalSize: number;
+    }
+  | {
+      type: "complete";
+      modelId: string;
+      progress: 100;
+      downloadedSize?: number;
+      totalSize?: number;
+    }
+  | {
+      type: "error";
+      modelId: string;
+      error: string;
+      code?: string;
+      details?: unknown;
+    };
+
 export interface ConversationPreview {
   id: number;
   title: string;
@@ -487,6 +557,7 @@ declare global {
       showDictationPanel: () => Promise<void>;
       onToggleDictation: (callback: () => void) => () => void;
       onToggleVoiceAgent?: (callback: () => void) => () => void;
+      onToggleTranslation?: (callback: () => void) => () => void;
       onStartDictation?: (callback: () => void) => () => void;
       onStopDictation?: (callback: () => void) => () => void;
 
@@ -532,6 +603,12 @@ declare global {
         audioBuffer: ArrayBuffer,
         metadata?: { durationMs?: number; provider?: string; model?: string }
       ) => Promise<{ success: boolean; path?: string }>;
+      mergeAudioSegments: (
+        segments: Array<{ buffer: ArrayBuffer; mimeType: string }>
+      ) => Promise<
+        | { success: true; buffer: ArrayBuffer; mimeType: "audio/webm" }
+        | { success: false; error: string }
+      >;
       getAudioPath: (id: number) => Promise<string | null>;
       showAudioInFolder: (id: number) => Promise<{ success: boolean }>;
       getAudioBuffer: (id: number) => Promise<ArrayBuffer | null>;
@@ -553,6 +630,7 @@ declare global {
           transcriptionMode?: InferenceMode;
           remoteTranscriptionType?: SelfHostedType;
           remoteTranscriptionUrl?: string;
+          remoteTranscriptionModel?: string;
         }
       ) => Promise<{
         success: boolean;
@@ -570,6 +648,13 @@ declare global {
       getDictionary: () => Promise<string[]>;
       setDictionary: (words: string[]) => Promise<{ success: boolean }>;
       onDictionaryUpdated?: (callback: (words: string[]) => void) => () => void;
+      getSnippets?: () => Promise<Array<{ trigger: string; replacement: string }>>;
+      setSnippets?: (
+        snippets: Array<{ trigger: string; replacement: string }>
+      ) => Promise<{ success: boolean }>;
+      onSnippetsUpdated?: (
+        callback: (snippets: Array<{ trigger: string; replacement: string }>) => void
+      ) => () => void;
       setAutoLearnEnabled?: (enabled: boolean) => void;
       onCorrectionsLearned?: (callback: (words: string[]) => void) => () => void;
       undoLearnedCorrections?: (words: string[]) => Promise<{ success: boolean }>;
@@ -673,7 +758,11 @@ declare global {
       onActionDeleted?: (callback: (payload: { id: number }) => void) => () => void;
 
       // Audio file operations
-      selectAudioFile: () => Promise<{ canceled: boolean; filePath?: string }>;
+      selectAudioFile: (options?: { multiple?: boolean }) => Promise<{
+        canceled: boolean;
+        filePath?: string;
+        filePaths?: string[];
+      }>;
       getFileSize?: (filePath: string) => Promise<number>;
       transcribeAudioFile: (
         filePath: string,
@@ -685,6 +774,31 @@ declare global {
         }
       ) => Promise<{ success: boolean; text?: string; error?: string }>;
       getPathForFile: (file: File) => string;
+
+      // URL audio download
+      downloadUrlAudio: (
+        url: string,
+        downloadId?: string
+      ) => Promise<
+        | {
+            success: true;
+            tempPath: string;
+            title: string;
+            durationSeconds: number | null;
+            sizeBytes: number;
+          }
+        | { success: false; error: string; code?: string }
+      >;
+      cancelUrlDownload: (downloadId?: string) => Promise<{ success: boolean }>;
+      deleteTempFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+      onUrlDownloadProgress?: (
+        callback: (data: {
+          stage: "resolving" | "downloading" | "ready";
+          percent: number;
+          title?: string;
+          downloadId?: string;
+        }) => void
+      ) => () => void;
 
       // Note event listeners
       onNoteAdded?: (callback: (note: NoteItem) => void) => () => void;
@@ -753,7 +867,7 @@ declare global {
       listGpus?: () => Promise<GpuDevice[]>;
       setGpuDeviceIndex?: (
         purpose: "transcription" | "intelligence",
-        index: number
+        uuid: string
       ) => Promise<{ success: boolean }>;
       getGpuDeviceIndex?: (purpose: "transcription" | "intelligence") => Promise<string>;
       detectGpu: () => Promise<GpuInfo>;
@@ -769,6 +883,20 @@ declare global {
         }) => void
       ) => () => void;
       onCudaFallbackNotification: (callback: () => void) => () => void;
+
+      // Vulkan GPU acceleration (whisper on AMD/Intel GPUs)
+      getVulkanWhisperStatus: () => Promise<VulkanWhisperStatus>;
+      downloadVulkanWhisperBinary: () => Promise<{ success: boolean; error?: string }>;
+      cancelVulkanWhisperDownload: () => Promise<{ success: boolean }>;
+      deleteVulkanWhisperBinary: () => Promise<{ success: boolean; deletedCount?: number }>;
+      onVulkanWhisperDownloadProgress: (
+        callback: (data: {
+          downloadedBytes: number;
+          totalBytes: number;
+          percentage: number;
+        }) => void
+      ) => () => void;
+      onGpuFallbackNotification: (callback: () => void) => () => void;
 
       // Parakeet operations (NVIDIA via sherpa-onnx)
       transcribeLocalParakeet: (
@@ -794,11 +922,12 @@ declare global {
         success: boolean;
         message?: string;
         error?: string;
+        code?: string;
       }>;
       getParakeetDiagnostics: () => Promise<ParakeetDiagnosticsResult>;
 
       // Local AI model management
-      modelGetAll: () => Promise<any[]>;
+      modelGetAll: () => Promise<LocalLLMModelStatus[]>;
       modelCheck: (modelId: string) => Promise<boolean>;
       modelDownload: (modelId: string) => Promise<{
         success: boolean;
@@ -826,7 +955,9 @@ declare global {
         details?: string;
       }>;
       modelCancelDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>;
-      onModelDownloadProgress: (callback: (event: any, data: any) => void) => () => void;
+      onModelDownloadProgress: (
+        callback: (event: any, data: LocalLLMDownloadProgressEvent) => void
+      ) => () => void;
 
       // Local reasoning
       processLocalReasoning: (
@@ -852,6 +983,27 @@ declare global {
         agentName: string | null,
         config: any
       ) => Promise<{ success: boolean; text?: string; error?: string; retryable?: boolean }>;
+      enterpriseStreamStart?: (payload: {
+        streamId: string;
+        provider: string;
+        modelId: string;
+        config: Record<string, string>;
+        options: Record<string, unknown>;
+      }) => Promise<{ success: boolean; error?: string }>;
+      enterpriseStreamCancel?: (streamId: string) => Promise<void>;
+      onEnterpriseStreamPart?: (
+        callback: (payload: {
+          streamId: string;
+          part?: unknown;
+          done?: boolean;
+          error?: string;
+        }) => void
+      ) => () => void;
+      listBedrockModels?: (config: Record<string, string>) => Promise<{
+        success: boolean;
+        models?: Array<{ value: string; label: string; vendor: string }>;
+        error?: string;
+      }>;
 
       // llama.cpp management
       llamaCppCheck: () => Promise<{ isInstalled: boolean; version?: string }>;
@@ -922,10 +1074,7 @@ declare global {
 
       // Hotkey management
       updateHotkey: (key: string) => Promise<{ success: boolean; message: string }>;
-      setHotkeyListeningMode?: (
-        enabled: boolean,
-        newHotkey?: string | null
-      ) => Promise<{ success: boolean }>;
+      setHotkeyListeningMode?: (enabled: boolean) => Promise<{ success: boolean }>;
       getHotkeyModeInfo?: () => Promise<{
         isUsingGnome: boolean;
         isUsingHyprland: boolean;
@@ -978,6 +1127,8 @@ declare global {
       // Groq API key management
       getGroqKey: () => Promise<string | null>;
       saveGroqKey: (key: string) => Promise<void>;
+      getOpenrouterKey: () => Promise<string | null>;
+      saveOpenrouterKey: (key: string) => Promise<void>;
 
       // xAI API key management
       getXaiKey?: () => Promise<string | null>;
@@ -1003,12 +1154,24 @@ declare global {
       saveCortiClientId?: (key: string) => Promise<void>;
       getCortiClientSecret?: () => Promise<string | null>;
       saveCortiClientSecret?: (key: string) => Promise<void>;
+      getCortiKey?: () => Promise<string | null>;
+      saveCortiKey?: (key: string) => Promise<void>;
       proxyCortiTranscription?: (data: {
         audioBuffer: ArrayBuffer;
         language: string;
         environment: string;
         tenant: string;
       }) => Promise<{ text: string }>;
+      getTinfoilKey?: () => Promise<string | null>;
+      saveTinfoilKey?: (key: string) => Promise<void>;
+      getTinfoilChatModels?: () => Promise<TinfoilCatalogModel[]>;
+      proxyTinfoilTranscription?: (data: {
+        audioBuffer: ArrayBuffer;
+        language?: string;
+        prompt?: string;
+      }) => Promise<
+        { text: string; model: string } | { error: string; code?: string; messageKey?: string }
+      >;
 
       // Custom endpoint API keys
       getCustomTranscriptionKey?: () => Promise<string | null>;
@@ -1121,6 +1284,7 @@ declare global {
       ) => Promise<{
         success: boolean;
         text?: string;
+        warning?: string;
         clientTranscriptionId?: string;
         wordsUsed?: number;
         wordsRemaining?: number;
@@ -1136,6 +1300,7 @@ declare global {
           customDictionary?: string[];
           customPrompt?: string;
           systemPrompt?: string;
+          promptMode?: "cleanup";
           language?: string;
           locale?: string;
         }
@@ -1243,6 +1408,7 @@ declare global {
       transcribeAudioFileCloud?: (filePath: string) => Promise<{
         success: boolean;
         text?: string;
+        warning?: string;
         error?: string;
         code?: string;
       }>;
@@ -1257,14 +1423,19 @@ declare global {
         apiKey: string;
         baseUrl: string;
         model: string;
+        diarize?: boolean;
         provider?: string;
         language?: string;
         environment?: string;
         tenant?: string;
+        transcriptionMode?: string;
+        remoteTranscriptionUrl?: string;
+        remoteTranscriptionModel?: string;
       }) => Promise<{
         success: boolean;
         text?: string;
         error?: string;
+        diarized?: boolean;
       }>;
 
       // Usage limit events
@@ -1354,6 +1525,8 @@ declare global {
       updateAgentHotkey?: (hotkey: string) => Promise<{ success: boolean; message: string }>;
       updateVoiceAgentHotkey?: (hotkey: string) => Promise<{ success: boolean; message: string }>;
       getVoiceAgentKey?: () => Promise<string>;
+      updateTranslationHotkey?: (hotkey: string) => Promise<{ success: boolean; message: string }>;
+      getTranslationKey?: () => Promise<string>;
       getAgentKey?: () => Promise<string>;
       saveAgentKey?: (key: string) => Promise<void>;
       createAgentConversation?: (
@@ -1673,6 +1846,19 @@ declare global {
         message?: string;
         error?: string;
       }>;
+      mergeSpeakerText?: (
+        segments: Array<{ start: number; end: number; speaker: string }>,
+        text: string,
+        duration: number
+      ) => Promise<{ success: boolean; text?: string; error?: string }>;
+      diarizeAudioFile?: (
+        filePath: string,
+        options?: { numSpeakers?: number; threshold?: number }
+      ) => Promise<{
+        success: boolean;
+        segments?: Array<{ start: number; end: number; speaker: string }>;
+        error?: string;
+      }>;
       onDiarizationDownloadProgress?: (callback: (data: any) => void) => () => void;
       onMeetingDiarizationComplete?: (
         callback: (data: {
@@ -1757,9 +1943,6 @@ declare global {
       onDictationRealtimeSessionEnd?: (callback: (data: { text: string }) => void) => () => void;
 
       // Google Calendar event listeners
-      onGcalMeetingStarting?: (callback: (data: any) => void) => () => void;
-      onGcalMeetingEnded?: (callback: (data: any) => void) => () => void;
-      onGcalStartRecording?: (callback: (data: any) => void) => () => void;
       onGcalConnectionChanged?: (callback: (data: any) => void) => () => void;
       onGcalEventsSynced?: (callback: (data: any) => void) => () => void;
 
@@ -1803,8 +1986,6 @@ declare global {
         speechPadMs?: number;
         samplesOverlap?: number;
       }) => Promise<{ success: boolean; config?: Record<string, unknown>; error?: string }>;
-      onMeetingDetected?: (callback: (data: any) => void) => () => void;
-      onMeetingDetectedStartRecording?: (callback: (data: any) => void) => () => void;
       onMeetingNotificationData?: (callback: (data: any) => void) => () => void;
       getMeetingNotificationData?: () => Promise<any>;
       meetingNotificationReady?: () => Promise<void>;
@@ -1820,9 +2001,11 @@ declare global {
         trigger?: "hotkey" | "manual" | "calendar-join";
       } | null>;
       onMeetingNoteNavigationPending?: (callback: () => void) => () => void;
-      onNavigateToNote?: (
-        callback: (data: { noteId: number; folderId: number | null }) => void
-      ) => () => void;
+      getPendingNoteNavigation?: () => Promise<{
+        noteId: number;
+        folderId: number | null;
+      } | null>;
+      onNoteNavigationPending?: (callback: () => void) => () => void;
       onUpdateNotificationData?: (
         callback: (data: { version: string; releaseDate?: string }) => void
       ) => () => void;
@@ -1841,8 +2024,12 @@ declare global {
         provider: string;
         model: string;
         language?: string;
+        display?: boolean;
       }) => Promise<{ success: boolean }>;
-      stopDictationPreview?: (opts?: { showCleanup?: boolean }) => Promise<{ success: boolean }>;
+      stopDictationPreview?: (opts?: {
+        showCleanup?: boolean;
+        flushed?: boolean;
+      }) => Promise<{ success: boolean; streamed?: boolean; text?: string }>;
       dismissDictationPreview?: () => Promise<{ success: boolean }>;
       completeDictationPreview?: (payload: { text?: string }) => Promise<{ success: boolean }>;
       hideDictationPreview?: () => Promise<{ success: boolean }>;
@@ -1871,6 +2058,12 @@ declare global {
       getFolderByClientId?: (clientFolderId: string) => Promise<FolderItem | null>;
       upsertFolderFromCloud?: (cloudFolder: Record<string, unknown>) => Promise<FolderItem>;
       markFolderSynced?: (id: number, cloudId: string) => Promise<void>;
+      adoptFolderIdentity?: (
+        id: number,
+        clientFolderId: string,
+        cloudId: string,
+        updatedAt?: string
+      ) => Promise<void>;
       getFolderIdMap?: () => Promise<FolderItem[]>;
       getPendingFolderDeletes?: () => Promise<FolderItem[]>;
       hardDeleteFolder?: (id: number) => Promise<{ success: boolean; id: number }>;
@@ -1907,6 +2100,25 @@ declare global {
       hardDeleteDictionary?: (id: number) => Promise<{ success: boolean; id: number }>;
       clearDictionaryCloudId?: (id: number) => Promise<{ success: boolean }>;
       broadcastDictionaryUpdated?: () => Promise<{ success: boolean }>;
+
+      getPendingSnippets?: () => Promise<SnippetEntryItem[]>;
+      getPendingSnippetDeletes?: () => Promise<SnippetEntryItem[]>;
+      getSnippetForCloudMerge?: (
+        cloudEntry: Record<string, unknown>
+      ) => Promise<SnippetEntryItem | null>;
+      upsertSnippetFromCloud?: (
+        cloudEntry: Record<string, unknown>
+      ) => Promise<SnippetEntryItem | null>;
+      markSnippetSynced?: (
+        id: number,
+        cloudId: string,
+        serverUpdatedAt?: string,
+        expectedTrigger?: string,
+        expectedReplacement?: string
+      ) => Promise<{ success: boolean; changes: number }>;
+      hardDeleteSnippet?: (id: number) => Promise<{ success: boolean; id: number }>;
+      clearSnippetCloudId?: (id: number) => Promise<{ success: boolean }>;
+      broadcastSnippetsUpdated?: () => Promise<{ success: boolean }>;
     };
 
     api?: {
