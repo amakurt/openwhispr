@@ -46,6 +46,7 @@ import { isAccessibilitySkipped } from "../utils/permissions";
 import {
   setActiveNoteId,
   setActiveFolderId,
+  navigateToContainer,
   useActiveNoteId,
   initializeNotes,
 } from "../stores/noteStore";
@@ -53,6 +54,7 @@ import { fetchProviders as fetchStreamingProviders } from "../stores/streamingPr
 import { executeTranslationChain, shouldRunTranslateStep } from "../helpers/translationChain";
 import HistoryView from "./HistoryView";
 import BackgroundActionToastListener from "./notes/BackgroundActionToastListener";
+import SpaceSyncToastListener from "./notes/SpaceSyncToastListener";
 import { syncService } from "../services/SyncService.js";
 import logger from "../utils/logger";
 import AcceptInvitationModal from "./AcceptInvitationModal";
@@ -60,11 +62,14 @@ import {
   consumePendingInvitationToken,
   clearPendingInvitationToken,
 } from "../utils/pendingInvitationToken";
-import { WORKSPACES_ENABLED } from "../lib/features";
 
 const platform = getCachedPlatform();
 
 const SIDEBAR_WIDTH_PX = 192;
+
+// Bump to force a one-time full semantic reindex on next launch (see the
+// reindex effect for the per-version history).
+const SEMANTIC_REINDEX_VERSION = 2;
 
 const toggleIconClass =
   "text-foreground/60 group-hover:text-foreground/75 dark:text-foreground/50 dark:group-hover:text-foreground/65 transition-colors duration-150";
@@ -100,6 +105,10 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   );
   const [showReferrals, setShowReferrals] = useState(false);
   const [invitationToken, setInvitationToken] = useState<string | null>(null);
+  const [invitationNotesEntry, setInvitationNotesEntry] = useState<{
+    workspaceId: string;
+    teamIds: string[];
+  } | null>(null);
   const [showSearch, setShowSearch] = useState(false);
   const showDiscarded = useShowDiscarded();
   const [showCloudMigrationBanner, setShowCloudMigrationBanner] = useState(false);
@@ -197,6 +206,26 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
     });
   }, []);
 
+  // One-time background reindex, versioned: v1 backfilled space_id payloads
+  // after the spaces migration; v2 backfills cloud-pulled notes, which were
+  // never incrementally indexed before the upsert-from-cloud handler gained a
+  // vector upsert. Delayed so the Qdrant sidecar has time to come up; if it
+  // isn't ready yet the flag stays unset and the next launch retries.
+  useEffect(() => {
+    if (Number(localStorage.getItem("semanticReindexVersion")) >= SEMANTIC_REINDEX_VERSION) return;
+    const timer = setTimeout(() => {
+      window.electronAPI
+        ?.semanticReindexAll?.()
+        .then((result) => {
+          if (result?.success) {
+            localStorage.setItem("semanticReindexVersion", String(SEMANTIC_REINDEX_VERSION));
+          }
+        })
+        .catch(() => {});
+    }, 15_000);
+    return () => clearTimeout(timer);
+  }, []);
+
   useEffect(() => {
     if (platform !== "darwin") return;
     window.electronAPI?.getPostMigrationState?.().then((state) => {
@@ -288,15 +317,22 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
   }, [usage?.isPastDue, usage?.hasLoaded, toast, t]);
 
   useEffect(() => {
-    if (!WORKSPACES_ENABLED) return;
     const unsubscribe = window.electronAPI?.onWorkspaceInvitationToken?.((token) => {
       setInvitationToken(token);
+      // Consume the main-process stash so a handled push isn't re-pulled on a
+      // later remount.
+      void window.electronAPI?.getPendingInvitationToken?.();
+    });
+    window.electronAPI?.getPendingInvitationToken?.().then((token) => {
+      if (token) setInvitationToken(token);
     });
     return () => unsubscribe?.();
   }, []);
 
   useEffect(() => {
-    if (!WORKSPACES_ENABLED || !authLoaded || !isSignedIn) return;
+    // Also when signed out (the modal's "Sign in to accept" handles auth);
+    // isSignedIn stays in the deps so a stored token resurfaces after sign-in.
+    if (!authLoaded) return;
     const pending = consumePendingInvitationToken();
     if (pending) {
       setInvitationToken(pending);
@@ -805,16 +841,14 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
         </Suspense>
       )}
 
-      {WORKSPACES_ENABLED && (
-        <AcceptInvitationModal
-          token={invitationToken}
-          onClose={() => setInvitationToken(null)}
-          isSignedIn={isSignedIn}
-          onSignIn={() => {
-            setInvitationToken(null);
-          }}
-        />
-      )}
+      <AcceptInvitationModal
+        token={invitationToken}
+        onClose={() => setInvitationToken(null)}
+        onAccepted={(entry) => {
+          setInvitationNotesEntry(entry);
+          setActiveView("personal-notes");
+        }}
+      />
 
       {showSearch && (
         <Suspense fallback={null}>
@@ -822,9 +856,14 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
             open={showSearch}
             onOpenChange={setShowSearch}
             transcriptions={history}
-            onNoteSelect={(id, folderId) => {
-              if (folderId) setActiveFolderId(folderId);
+            onNoteSelect={(id, folderId, spaceId) => {
+              if (folderId != null) setActiveFolderId(folderId);
+              else if (spaceId != null) navigateToContainer(spaceId, null);
               setActiveNoteId(id);
+              setActiveView("personal-notes");
+            }}
+            onContainerSelect={(spaceId, folderId) => {
+              navigateToContainer(spaceId, folderId);
               setActiveView("personal-notes");
             }}
             onTranscriptSelect={() => {
@@ -1038,6 +1077,8 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                   onOpenSearch={() => setShowSearch(true)}
                   meetingRecordingRequest={meetingRecordingRequest}
                   onMeetingRecordingRequestHandled={handleMeetingRecordingRequestHandled}
+                  invitationEntry={invitationNotesEntry}
+                  onInvitationEntryHandled={() => setInvitationNotesEntry(null)}
                 />
               </Suspense>
             )}
@@ -1098,6 +1139,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
         )}
       </div>
       <BackgroundActionToastListener />
+      <SpaceSyncToastListener />
     </div>
   );
 }

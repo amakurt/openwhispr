@@ -2,22 +2,41 @@ import { createAuthClient } from "better-auth/react";
 import { ssoClient } from "@better-auth/sso/client";
 import { OPENWHISPR_API_URL } from "../config/constants";
 import { openExternalLink } from "../utils/externalLinks";
+import {
+  authContextFetch,
+  handleAuthRequestError,
+  handleAuthRequestResponse,
+  handleAuthRequestSuccess,
+  observeAuthTokenStateEvent,
+  prepareAuthRequest,
+} from "./authRequestContext";
 
 export const AUTH_URL = import.meta.env.VITE_AUTH_URL || "https://auth.openwhispr.com";
 export const authClient = createAuthClient({
   baseURL: AUTH_URL,
   plugins: [ssoClient()],
   fetchOptions: {
-    auth: {
-      type: "Bearer",
-      token: async () => (await window.electronAPI?.authGetToken?.()) ?? "",
-    },
+    credentials: "omit",
+    customFetchImpl: authContextFetch,
     headers: { "x-openwhispr-source": "desktop" },
-    onSuccess: async (ctx: { response: Response }) => {
-      const newToken = ctx.response.headers.get("set-auth-token");
-      if (newToken) await window.electronAPI?.authSetToken?.(newToken);
-    },
+    onRequest: prepareAuthRequest,
+    onResponse: handleAuthRequestResponse,
+    onSuccess: handleAuthRequestSuccess,
+    onError: handleAuthRequestError,
   },
+});
+
+let authRefetchTimer: ReturnType<typeof setTimeout> | null = null;
+window.electronAPI?.onAuthTokenStateChanged?.((state) => {
+  observeAuthTokenStateEvent(state);
+  // Main broadcasts a successful compare-and-set rotation before the IPC
+  // invocation resolves. Deferring avoids aborting the exact session request
+  // that is about to bind the new generation.
+  if (authRefetchTimer) clearTimeout(authRefetchTimer);
+  authRefetchTimer = setTimeout(() => {
+    authRefetchTimer = null;
+    authClient.$store.notify("$sessionSignal");
+  }, 0);
 });
 
 export type SocialProvider = "google" | "microsoft" | "apple";
@@ -107,6 +126,12 @@ export function isWithinGracePeriod(): boolean {
   return elapsed < GRACE_PERIOD_MS;
 }
 
+export function getGracePeriodRemainingMs(): number {
+  const startedAt = getLastSignInTime();
+  if (!startedAt) return 0;
+  return Math.max(0, GRACE_PERIOD_MS - Math.max(0, Date.now() - startedAt));
+}
+
 export async function deleteAccount(): Promise<{ error?: Error }> {
   if (!OPENWHISPR_API_URL) {
     return { error: new Error("API not configured") };
@@ -132,11 +157,13 @@ export async function deleteAccount(): Promise<{ error?: Error }> {
 export async function signOut(): Promise<void> {
   try {
     await authClient.signOut();
-    if (window.electronAPI?.authClearSession) {
-      await window.electronAPI.authClearSession();
-    }
-    markSignedOutState();
   } catch {
+    // Local sign-out must still cross a credential generation boundary when
+    // the server is offline; the remote session can expire independently.
+  } finally {
+    if (window.electronAPI?.authClearSession) {
+      await window.electronAPI.authClearSession().catch(() => undefined);
+    }
     markSignedOutState();
   }
 }

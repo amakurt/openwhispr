@@ -1,19 +1,14 @@
-// KDE/GNOME Wayland: self-relaunch with --ozone-platform=x11 to force XWayland.
-// Chromium picks the display backend before JS runs, so appendSwitch is too late.
-if (
-  process.platform === "linux" &&
-  process.env.XDG_SESSION_TYPE === "wayland" &&
-  !process.argv.includes("--ozone-platform=x11")
-) {
-  const desktop = (process.env.XDG_CURRENT_DESKTOP || "").toLowerCase();
-  if (desktop.includes("kde") || /gnome|ubuntu|unity|cosmic/.test(desktop)) {
-    const { spawn } = require("child_process");
-    spawn(process.execPath, [...process.argv.slice(1), "--ozone-platform=x11"], {
-      stdio: "inherit",
-      detached: true,
-    }).unref();
-    process.exit(0);
-  }
+// Chromium picks the display backend before JS runs, so appendSwitch is too
+// late — the flag has to come from a relaunch.
+const { XWAYLAND_FLAG, shouldForceXWayland } = require("./src/helpers/xwayland");
+
+if (shouldForceXWayland(process.argv)) {
+  const { spawn } = require("child_process");
+  spawn(process.execPath, [...process.argv.slice(1), XWAYLAND_FLAG], {
+    stdio: "inherit",
+    detached: true,
+  }).unref();
+  process.exit(0);
 }
 
 const {
@@ -289,6 +284,7 @@ const LinuxPortalAudioManager = require("./src/helpers/linuxPortalAudioManager")
 const WindowsLoopbackAudioManager = require("./src/helpers/windowsLoopbackAudioManager");
 const MeetingAecManager = require("./src/helpers/meetingAecManager");
 const MeetingDetectionEngine = require("./src/helpers/meetingDetectionEngine");
+const { applyOpenWhisprOriginHeader } = require("./src/helpers/sessionHeaders");
 const { i18nMain, changeLanguage } = require("./src/helpers/i18nMain");
 const { ensureYdotool } = require("./src/helpers/ensureYdotool");
 const sidecarRegistry = require("./src/helpers/sidecarRegistry");
@@ -543,6 +539,18 @@ function isInvitationDeepLink(url) {
   return url.slice(`${OAUTH_PROTOCOL}://`.length).startsWith("invitations/");
 }
 
+// Deep links can arrive before windowManager exists (cold start) or before the
+// renderer has mounted its listener. The token is stashed here and the renderer
+// pulls it via `get-pending-invitation-token` on mount; the push below is a
+// best-effort fast path for an already-running app.
+let pendingInvitationDeepLinkToken = null;
+
+ipcMain.handle("get-pending-invitation-token", () => {
+  const token = pendingInvitationDeepLinkToken;
+  pendingInvitationDeepLinkToken = null;
+  return token;
+});
+
 function isNoteDeepLink(url) {
   return url.slice(`${OAUTH_PROTOCOL}://`.length).startsWith("notes/");
 }
@@ -621,20 +629,16 @@ function handleInvitationDeepLink(deepLinkUrl) {
     const match = deepLinkUrl.match(/invitations\/([^/?#]+)/);
     const token = match?.[1];
     if (!token) return;
-    if (windowManager && isLiveWindow(windowManager.controlPanelWindow)) {
+    pendingInvitationDeepLinkToken = token;
+    if (!windowManager) return;
+    if (isLiveWindow(windowManager.controlPanelWindow)) {
       windowManager.controlPanelWindow.show();
       windowManager.controlPanelWindow.focus();
       dockManager.setControlPanelVisible(true);
+      // Best-effort fast path — the get-pending-invitation-token pull is the reliable path.
       windowManager.controlPanelWindow.webContents.send("workspace-invitation-token", token);
-    } else if (windowManager) {
+    } else {
       windowManager.createControlPanelWindow();
-      // Defer the send until renderer is ready; main.js relies on `did-finish-load`
-      const win = windowManager.controlPanelWindow;
-      if (win) {
-        win.webContents.once("did-finish-load", () => {
-          win.webContents.send("workspace-invitation-token", token);
-        });
-      }
     }
   } catch (error) {
     console.error("Invitation deep link parse failed:", error);
@@ -879,27 +883,7 @@ async function startApp() {
 
   await migrateCookieToBearerToken();
 
-  // Electron's file:// renderer sends Origin: null, which Better Auth's
-  // trustedOrigins check rejects. Spoof Origin to the request's own URL so
-  // calls to OpenWhispr's auth and API hosts are treated as same-origin.
-  session.defaultSession.webRequest.onBeforeSendHeaders(
-    {
-      urls: [
-        "https://auth.openwhispr.com/*",
-        "https://api.openwhispr.com/*",
-        "http://localhost:3000/*",
-        "http://127.0.0.1:3000/*",
-      ],
-    },
-    (details, callback) => {
-      try {
-        details.requestHeaders["Origin"] = new URL(details.url).origin;
-      } catch {
-        // malformed URL — leave Origin as-is
-      }
-      callback({ requestHeaders: details.requestHeaders });
-    }
-  );
+  applyOpenWhisprOriginHeader(session.defaultSession);
 
   windowManager.setActivationModeCache(environmentManager.getActivationMode());
   windowManager.setFloatingIconAutoHide(environmentManager.getFloatingIconAutoHide());
@@ -944,10 +928,21 @@ async function startApp() {
     await windowManager.createControlPanelWindow();
   }
 
+  // Windows/Linux cold start delivers protocol URLs via argv (macOS uses
+  // open-url); without this scan a deep link that launches the app is lost.
   const initialProtocolUrl = process.argv.find((arg) => arg.startsWith(`${OAUTH_PROTOCOL}://`));
   if (initialProtocolUrl && isNoteDeepLink(initialProtocolUrl)) {
     await handleNoteDeepLink(initialProtocolUrl);
   } else {
+    if (initialProtocolUrl && process.platform !== "darwin") {
+      if (initialProtocolUrl.includes("upgrade-success")) {
+        handleUpgradeDeepLink();
+      } else if (isInvitationDeepLink(initialProtocolUrl)) {
+        handleInvitationDeepLink(initialProtocolUrl);
+      } else {
+        void handleOAuthDeepLink(initialProtocolUrl);
+      }
+    }
     await flushPendingNoteDeepLink();
   }
 
@@ -1144,9 +1139,14 @@ async function startApp() {
         if (qdrantManager.isReady()) {
           const vectorIndex = require("./src/helpers/vectorIndex");
           vectorIndex.init(qdrantManager.getPort());
-          vectorIndex.ensureCollection().catch((err) => {
-            debugLogger.debug("Qdrant collection setup error (non-fatal)", { error: err.message });
-          });
+          vectorIndex
+            .ensureCollection()
+            .then(() => ipcHandlers?.drainPendingVectorPurges())
+            .catch((err) => {
+              debugLogger.debug("Qdrant collection setup error (non-fatal)", {
+                error: err.message,
+              });
+            });
         }
       })
       .catch((err) => {
