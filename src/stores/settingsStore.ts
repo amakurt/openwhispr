@@ -32,7 +32,7 @@ import type {
   ThemeSettings,
   ChatAgentSettings,
 } from "../hooks/useSettings";
-import type { Snippet } from "../utils/snippets";
+import { type Snippet, DEFAULT_SYMBOL_SNIPPETS } from "../utils/snippets";
 
 let _ReasoningService: typeof import("../services/ReasoningService").default | null = null;
 
@@ -958,9 +958,14 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   snippets: (() => {
     try {
       const parsed = JSON.parse(readString("snippets", "[]"));
-      return Array.isArray(parsed) ? (parsed as Snippet[]) : [];
+      const existing = Array.isArray(parsed) ? (parsed as Snippet[]) : [];
+      const existingTriggers = new Set(existing.map((s) => s.trigger.toLowerCase()));
+      const defaults = DEFAULT_SYMBOL_SNIPPETS.filter(
+        (d) => !existingTriggers.has(d.trigger.toLowerCase())
+      );
+      return defaults.length > 0 ? [...existing, ...defaults] : existing;
     } catch {
-      return [];
+      return [...DEFAULT_SYMBOL_SNIPPETS];
     }
   })(),
   assemblyAiStreaming: readBoolean("assemblyAiStreaming", true),
@@ -2457,8 +2462,18 @@ export async function initializeSettings(): Promise<void> {
           if (isBrowser) localStorage.setItem("snippets", JSON.stringify(normalizedSnippets));
           useSettingsStore.setState({ snippets: normalizedSnippets });
         } else if (dbSnippets.length > 0) {
-          if (isBrowser) localStorage.setItem("snippets", JSON.stringify(dbSnippets));
-          useSettingsStore.setState({ snippets: dbSnippets });
+          // Merge new default triggers that are missing from the DB
+          const dbTriggers = new Set(dbSnippets.map((s: Snippet) => s.trigger.toLowerCase()));
+          const missingDefaults = DEFAULT_SYMBOL_SNIPPETS.filter(
+            (d) => !dbTriggers.has(d.trigger.toLowerCase())
+          );
+          const merged =
+            missingDefaults.length > 0 ? [...dbSnippets, ...missingDefaults] : dbSnippets;
+          if (missingDefaults.length > 0) {
+            await window.electronAPI.setSnippets?.(merged);
+          }
+          if (isBrowser) localStorage.setItem("snippets", JSON.stringify(merged));
+          useSettingsStore.setState({ snippets: merged });
         }
       }
     } catch (err) {
